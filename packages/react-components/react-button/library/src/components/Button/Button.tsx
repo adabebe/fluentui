@@ -11,6 +11,7 @@ import { useCustomStyleHook_unstable } from '@fluentui/react-shared-contexts';
 /**
  * Buttons give people a way to trigger an action.
  */
+// Risk pilot end-to-end test.
 export const Button: ForwardRefComponent<ButtonProps> = React.forwardRef((props, ref) => {
   const state = useButton_unstable(props, ref);
 

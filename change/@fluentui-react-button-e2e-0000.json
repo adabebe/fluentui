@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "e2e test",
+  "packageName": "@fluentui/react-button",
+  "email": "test@example.com",
+  "dependentChangeType": "patch"
+}
