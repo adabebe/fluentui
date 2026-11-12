@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/naming-convention -- GitHub REST API fixtures use upstream field names. */
-import { revisionKey } from './risk-policy';
 import type { ChangedFile } from './risk-tiers';
 import { classifyRisk, hasReviewFocus, rules, tierLabels } from './risk-tiers';
 
@@ -259,7 +258,7 @@ const diffText = 'diff --git a/example b/example\n+change';
 const config = { tenantId: '22222222-2222-2222-2222-222222222222' };
 const decision = (suggested: number) => ({
   tier: suggested,
-  model: 'microsoft-decision-1',
+  model: 'example-model-1',
   confidence: 0.9,
   inputTokens: 100,
   outputTokens: 1,
@@ -269,6 +268,7 @@ function workflowFixture(paths = [file(source)]) {
   const data = {
     head: { sha: 'head-sha' },
     base: { sha: 'base-sha', ref: 'master', repo: { full_name: 'microsoft/fluentui' } },
+    user: { login: 'author' },
     author_association: 'MEMBER',
     title: 'fix(button): correct behavior',
     body: 'Review focus: Confirm the intended behavior.',
@@ -286,6 +286,7 @@ function workflowFixture(paths = [file(source)]) {
         listFiles: jest.fn(),
       },
       issues: { addLabels: jest.fn(), removeLabel: jest.fn() },
+      repos: { getCollaboratorPermissionLevel: jest.fn().mockResolvedValue({ data: { permission: 'write' } }) },
       checks: { update: jest.fn() },
     },
     paginate: jest.fn().mockResolvedValue(paths),
@@ -301,7 +302,7 @@ function workflowFixture(paths = [file(source)]) {
     core,
     env: { RISK_MODEL_MODE: 'raise' } as Record<string, string>,
     assessRisk: jest.fn().mockResolvedValue(decision(0)),
-    checkRun: { id: 456, identity: revisionKey(data) },
+    checkRun: { id: 456, headSha: data.head.sha },
     context: { repo: { owner: 'microsoft', repo: 'fluentui' }, issue: { number: 123 } },
   };
 }
@@ -341,7 +342,6 @@ describe('risk workflow', () => {
     ] as const) {
       const args = workflowFixture([file(path)]);
       args.data.body = '';
-      args.checkRun.identity = revisionKey(args.data);
       await runWorkflow(args);
       expect(conclusion(args)).toBe('success');
       expect(args.core.setFailed).not.toHaveBeenCalled();
@@ -370,12 +370,11 @@ describe('risk workflow', () => {
   test('labels a truncated listing as standard', async () => {
     const args = workflowFixture();
     args.data.changed_files = 2;
-    args.checkRun.identity = revisionKey(args.data);
     await runWorkflow(args);
     expect(labelsAdded(args)).toEqual(['Risk: standard']);
   });
 
-  test.each(['head', 'body', 'title'])('does not certify concurrent changes to %s', async key => {
+  test.each(['head', 'body'])('does not certify concurrent changes to %s', async key => {
     const args = workflowFixture();
     args.github.rest.pulls.get
       .mockResolvedValueOnce({ data: args.data })
@@ -401,14 +400,11 @@ describe('risk workflow', () => {
   });
 
   test.each([
-    ['a stale revision', { id: 456, identity: 'old-identity' }],
-    ['an invalid check id', { id: 0, identity: '' }],
+    ['a stale head', { id: 456, headSha: 'old-head' }],
+    ['an invalid check id', { id: 0, headSha: 'head-sha' }],
   ])('rejects %s before calling the model or changing labels', async (_, checkRun) => {
     const args = workflowFixture();
-    if (checkRun.id === 0) {
-      checkRun.identity = revisionKey(args.data);
-    }
-    await expect(runWorkflow({ ...args, checkRun })).rejects.toThrow('trusted workflow revision');
+    await expect(runWorkflow({ ...args, checkRun })).rejects.toThrow('head changed since this run started');
     expect(args.assessRisk).not.toHaveBeenCalled();
     expect(args.github.rest.issues.addLabels).not.toHaveBeenCalled();
     expect(conclusion(args)).toBe('failure');
@@ -451,7 +447,6 @@ describe('risk workflow', () => {
   test('model escalation also asks for the human review focus', async () => {
     const args = workflowFixture([file(story)]);
     args.data.body = '';
-    args.checkRun.identity = revisionKey(args.data);
     args.assessRisk.mockResolvedValue(decision(2));
     await runWorkflow(args);
     expect(checkOutput(args).title).toBe('Tier 2: add a review focus line');
@@ -459,7 +454,7 @@ describe('risk workflow', () => {
   });
 
   test.each([
-    ['provider failure', new Error('Decision unavailable')],
+    ['provider failure', new Error('Model unavailable')],
     ['oversized diff', new Error('The diff is too large for the model (48 KiB request limit)')],
   ])('a %s still labels the PR, but never in the fast lane', async (_, error) => {
     for (const [path, expected] of [
@@ -480,7 +475,7 @@ describe('risk workflow', () => {
     await runWorkflow({
       ...args,
       assessRisk: undefined,
-      env: { ...args.env, RISK_DECISION_ENDPOINT: 'http://insecure.test' },
+      env: { ...args.env, RISK_MODEL_ENDPOINT: 'http://insecure.test' },
     });
     expect(labelsAdded(args)).toEqual(['Risk: standard']);
     expect(summary(args)).toContain('partly or wrongly configured');
@@ -494,10 +489,10 @@ describe('risk workflow', () => {
     expect(summary(args)).toContain('Shadow mode, not applied: with the model this would be tier 3.');
 
     const failing = workflowFixture([file(source)]);
-    failing.assessRisk.mockRejectedValue(new Error('Decision unavailable'));
+    failing.assessRisk.mockRejectedValue(new Error('Model unavailable'));
     await runWorkflow({ ...failing, env: { RISK_MODEL_MODE: 'shadow' } });
     expect(labelsAdded(failing)).toEqual(['Risk: low']);
-    expect(summary(failing)).toContain('Model could not assess the change (Decision unavailable). The deterministic');
+    expect(summary(failing)).toContain('Model could not assess the change (Model unavailable). The deterministic');
   });
 
   test('a failure to fetch the diff is a model failure, not a workflow failure', async () => {
@@ -523,7 +518,7 @@ describe('risk workflow', () => {
   test('without a configured model, shadow mode keeps the deterministic tier and raise mode leaves the fast lane', async () => {
     const shadow = workflowFixture([file(story)]);
     // The repository's shared AZURE_TENANT_ID secret alone does not configure the model.
-    await runWorkflow({ ...shadow, assessRisk: undefined, env: { RISK_CLASSIFIER_AZURE_TENANT_ID: config.tenantId } });
+    await runWorkflow({ ...shadow, assessRisk: undefined, env: { RISK_MODEL_AZURE_TENANT_ID: config.tenantId } });
     expect(labelsAdded(shadow)).toEqual(['Risk: trivial']);
     expect(summary(shadow)).toContain('Model not configured. The deterministic tier stands.');
 
@@ -533,33 +528,78 @@ describe('risk workflow', () => {
     expect(summary(raise)).toContain('Model not configured. A fast-lane tier needs a model assessment');
   });
 
-  test("an outside contributor's PR gets the model only after a maintainer adds ai-review", async () => {
+  test('an author without write access gets the model only after a maintainer adds ai-review', async () => {
     for (const [env, expected] of [
       [{}, 'Risk: trivial'],
       [{ RISK_MODEL_MODE: 'raise' }, 'Risk: standard'],
     ] as const) {
       const args = workflowFixture([file(story)]);
-      args.data.author_association = 'CONTRIBUTOR';
-      args.checkRun.identity = revisionKey(args.data);
+      args.github.rest.repos.getCollaboratorPermissionLevel.mockResolvedValue({ data: { permission: 'read' } });
       await runWorkflow({ ...args, env });
       expect(args.assessRisk).not.toHaveBeenCalled();
       expect(labelsAdded(args)).toEqual([expected]);
-      expect(summary(args)).toContain('outside contributor');
+      expect(summary(args)).toContain('the author has no write access');
     }
 
     const labeled = workflowFixture([file(story)]);
-    labeled.data.author_association = 'FIRST_TIME_CONTRIBUTOR';
+    labeled.github.rest.repos.getCollaboratorPermissionLevel.mockResolvedValue({ data: { permission: 'none' } });
     labeled.data.labels.push({ name: 'ai-review' });
-    labeled.checkRun.identity = revisionKey(labeled.data);
     labeled.assessRisk.mockResolvedValue(decision(3));
     await runWorkflow(labeled);
     expect(labelsAdded(labeled)).toEqual(['Risk: high']);
+    expect(labeled.github.rest.repos.getCollaboratorPermissionLevel).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['admin', true],
+    ['write', true],
+    ['read', false],
+    ['none', false],
+  ])('repository permission %s decides whether the author is trusted', async (permission, trusted) => {
+    const args = workflowFixture([file(story)]);
+    args.data.author_association = 'MEMBER';
+    args.github.rest.repos.getCollaboratorPermissionLevel.mockResolvedValue({ data: { permission } });
+    await runWorkflow(args);
+    expect(args.github.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledWith({
+      owner: 'microsoft',
+      repo: 'fluentui',
+      username: 'author',
+    });
+    expect(args.assessRisk).toHaveBeenCalledTimes(trusted ? 1 : 0);
+  });
+
+  test('an unknown author is untrusted; an unverifiable one falls back to the author association', async () => {
+    const missing = workflowFixture([file(story)]);
+    missing.github.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue(
+      Object.assign(new Error(), { status: 404 }),
+    );
+    await runWorkflow(missing);
+    expect(missing.assessRisk).not.toHaveBeenCalled();
+
+    for (const [association, trusted] of [
+      ['MEMBER', true],
+      ['CONTRIBUTOR', false],
+    ] as const) {
+      const args = workflowFixture([file(story)]);
+      args.data.author_association = association;
+      args.github.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue(
+        Object.assign(new Error('forbidden'), { status: 403 }),
+      );
+      await runWorkflow(args);
+      expect(args.assessRisk).toHaveBeenCalledTimes(trusted ? 1 : 0);
+      expect(summary(args)).toContain('Author permission could not be verified');
+    }
+  });
+
+  test('a tier 3 change never looks up the author', async () => {
+    const args = workflowFixture([file('AGENTS.md')]);
+    await runWorkflow(args);
+    expect(args.github.rest.repos.getCollaboratorPermissionLevel).not.toHaveBeenCalled();
   });
 
   test('a trusted author with the ai-review label gets the model once', async () => {
     const args = workflowFixture([file(story)]);
     args.data.labels.push({ name: 'ai-review' });
-    args.checkRun.identity = revisionKey(args.data);
     await runWorkflow(args);
     expect(args.assessRisk).toHaveBeenCalledTimes(1);
   });

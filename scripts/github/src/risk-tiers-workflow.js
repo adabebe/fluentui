@@ -1,15 +1,61 @@
 // @ts-check
 
-const { decideRisk, getDecisionConfig, getDecisionToken } = require('./risk-decision');
-const { revisionKey } = require('./risk-policy');
+const { createHash } = require('node:crypto');
+
+const { askRiskModel, getRiskModelConfig, getRiskModelToken } = require('./risk-model');
 const { classifyRisk, hasReviewFocus, tierLabels } = require('./risk-tiers');
 
-// Pull requests from these authors get the model automatically; anyone else needs a maintainer's label first.
-const trustedAuthors = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 const aiReviewLabel = 'ai-review';
+// The legacy permission field maps `maintain` to `write` and `triage` to `read`.
+const trustedPermissions = ['admin', 'write'];
+// Used only when the permission lookup fails: `author_association` is unreliable (private org members may show as
+// CONTRIBUTOR) and `MEMBER` means any member of the organization.
+const trustedAssociations = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
 /** @typedef {import('./risk-tiers').Tier} Tier */
-/** @typedef {(input: Parameters<typeof decideRisk>[0]) => ReturnType<typeof decideRisk>} AssessRisk */
+/** @typedef {(input: Parameters<typeof askRiskModel>[0]) => ReturnType<typeof askRiskModel>} AssessRisk */
+/** @typedef {{ trusted: boolean; note?: string }} AuthorTrust */
+
+/**
+ * Everything the published result depends on besides the file list: a change to any of these during
+ * classification means the result would describe a revision that no longer exists.
+ *
+ * @param {{ head: { sha: string }; base: { sha: string; ref: string; repo: { full_name: string } }; body: string | null }} pull
+ */
+function revisionKey(pull) {
+  return createHash('sha256')
+    .update(JSON.stringify([pull.head.sha, pull.base.sha, pull.base.ref, pull.base.repo.full_name, pull.body]))
+    .digest('hex');
+}
+
+/**
+ * Whether the author may get the model without a maintainer's `ai-review` label: write access to the repository.
+ *
+ * @param {ReturnType<typeof import('@actions/github').getOctokit>} github
+ * @param {{ owner: string; repo: string }} repository
+ * @param {{ user: { login: string } | null; author_association: string }} pull
+ * @returns {Promise<AuthorTrust>}
+ */
+async function authorTrust(github, repository, pull) {
+  if (!pull.user) {
+    return { trusted: false };
+  }
+  try {
+    const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+      ...repository,
+      username: pull.user.login,
+    });
+    return { trusted: trustedPermissions.includes(data.permission) };
+  } catch (error) {
+    if (/** @type {{ status?: number }} */ (error).status === 404) {
+      return { trusted: false };
+    }
+    return {
+      trusted: trustedAssociations.includes(pull.author_association),
+      note: 'Author permission could not be verified, so the author association was used.',
+    };
+  }
+}
 
 /**
  * @param {{ getIDToken: (audience: string) => Promise<string> }} core
@@ -19,14 +65,20 @@ const aiReviewLabel = 'ai-review';
 function configuredModel(core, env) {
   let config;
   try {
-    config = getDecisionConfig(env);
+    config = getRiskModelConfig(env);
   } catch (error) {
     // A broken configuration must be visible, so it fails every call instead of disabling the model.
     return () => Promise.reject(error);
   }
   return (
     config &&
-    (input => decideRisk(input, { endpoint: config.endpoint, getToken: () => getDecisionToken(core, config) }))
+    (input =>
+      askRiskModel(input, {
+        endpoint: config.endpoint,
+        deployment: config.deployment,
+        model: config.model,
+        getToken: () => getRiskModelToken(core, config),
+      }))
   );
 }
 
@@ -34,18 +86,20 @@ function configuredModel(core, env) {
  * Asks the model whether the deterministic tier should be higher. The model never lowers a tier and never prevents a
  * label. In shadow mode (the default) its suggestion is only reported and the deterministic tier stands. In raise
  * mode its suggestion applies, and a fast-lane tier (0 or 1) needs a model assessment: when the model is not
- * configured, not allowed to run (an outside contributor's PR without `ai-review`), or fails, the tier is at least 2.
+ * configured, not allowed to run (an author without write access and no `ai-review` label), or fails, the tier is
+ * at least 2.
  *
  * @param {{
- *   pull: { author_association: string; labels: { name?: string }[] };
+ *   pull: { labels: { name?: string }[] };
  *   deterministic: { tier: Tier; reason: string };
+ *   getTrust: () => Promise<AuthorTrust>;
  *   getDiff: () => Promise<unknown>;
  *   assessRisk: AssessRisk | undefined;
  *   raise: boolean;
  * }} args
  * @returns {Promise<{ tier: number; summary: string; modelTier?: number; confidence?: number }>}
  */
-async function escalate({ pull, deterministic, getDiff, assessRisk, raise }) {
+async function escalate({ pull, deterministic, getTrust, getDiff, assessRisk, raise }) {
   const floor = deterministic.tier;
   /** @param {string} why */
   const unassessed = why =>
@@ -61,9 +115,13 @@ async function escalate({ pull, deterministic, getDiff, assessRisk, raise }) {
   if (!assessRisk) {
     return unassessed('Model not configured.');
   }
-  if (!trustedAuthors.includes(pull.author_association) && !pull.labels.some(label => label.name === aiReviewLabel)) {
+  const labeled = pull.labels.some(label => label.name === aiReviewLabel);
+  const trust = labeled ? { trusted: true } : await getTrust();
+  const note = trust.note ? `${trust.note} ` : '';
+  if (!trust.trusted) {
     return unassessed(
-      `Model not called for an outside contributor: a maintainer can add the \`${aiReviewLabel}\` label and rerun.`,
+      `${note}Model not called: the author has no write access. A maintainer can add the \`${aiReviewLabel}\` ` +
+        'label and rerun.',
     );
   }
   try {
@@ -71,12 +129,12 @@ async function escalate({ pull, deterministic, getDiff, assessRisk, raise }) {
     if (typeof diff !== 'string') {
       throw new Error('GitHub did not return the PR diff.');
     }
-    const decision = await assessRisk({ diff, deterministic });
-    const suggested = Math.max(floor, decision.tier);
+    const answer = await assessRisk({ diff, deterministic });
+    const suggested = Math.max(floor, answer.tier);
     const details =
-      `Model suggested tier ${decision.tier}. Model ${decision.model}, confidence ${decision.confidence} ` +
-      `(uncalibrated), tokens ${decision.inputTokens} input / ${decision.outputTokens} output.`;
-    const measured = { modelTier: decision.tier, confidence: decision.confidence };
+      `${note}Model suggested tier ${answer.tier}. Model ${answer.model}, confidence ${answer.confidence} ` +
+      `(uncalibrated), tokens ${answer.inputTokens} input / ${answer.outputTokens} output.`;
+    const measured = { modelTier: answer.tier, confidence: answer.confidence };
     return raise
       ? { tier: suggested, summary: details, ...measured }
       : {
@@ -94,12 +152,13 @@ async function escalate({ pull, deterministic, getDiff, assessRisk, raise }) {
 /**
  * Classifies one pull request revision and publishes exactly one risk label and the `PR risk assessment` check.
  * Runs base-branch code only: it reads the PR through the API and never checks out or executes PR code.
+ * `checkRun` is the check the workflow created for `headSha` before checking out; it is completed exactly once.
  *
  * @param {{
  *   github: ReturnType<typeof import('@actions/github').getOctokit>,
  *   context: typeof import('@actions/github').context,
  *   core: typeof import('@actions/core'),
- *   checkRun: { id: number; identity: string },
+ *   checkRun: { id: number; headSha: string },
  *   env?: NodeJS.ProcessEnv,
  *   assessRisk?: AssessRisk
  * }} args Set `env.RISK_MODEL_MODE` to `raise` to let the model change labels; anything else is shadow mode.
@@ -117,10 +176,10 @@ module.exports = async ({
   const params = { owner, repo, pull_number: issueNumber };
   try {
     const { data: pull } = await github.rest.pulls.get(params);
-    const identity = revisionKey(pull);
-    if (!Number.isSafeInteger(checkRun.id) || checkRun.id <= 0 || identity !== checkRun.identity) {
-      throw new Error('The PR no longer matches the trusted workflow revision. Trigger a fresh classification.');
+    if (!Number.isSafeInteger(checkRun.id) || checkRun.id <= 0 || pull.head.sha !== checkRun.headSha) {
+      throw new Error('The PR head changed since this run started. The run for the new head classifies it.');
     }
+    const identity = revisionKey(pull);
 
     const raise = env.RISK_MODEL_MODE === 'raise';
     const files = await github.paginate(github.rest.pulls.listFiles, { ...params, per_page: 100 });
@@ -128,6 +187,7 @@ module.exports = async ({
     const model = await escalate({
       pull,
       deterministic,
+      getTrust: () => authorTrust(github, { owner, repo }, pull),
       getDiff: async () => (await github.rest.pulls.get({ ...params, mediaType: { format: 'diff' } })).data,
       assessRisk,
       raise,

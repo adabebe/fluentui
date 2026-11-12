@@ -2,15 +2,16 @@
 
 const { rules, tiers } = require('./risk-tiers');
 
-// The deployment answers the native Choice protocol (one rated choice), not chat completions.
-const deployment = 'Decision-1';
+// The deployment answers a native rated-choice protocol (one question, one choice), not chat completions. Its
+// deployment name and model identity are repository variables, not code.
 const maxRequestBytes = 48 * 1024;
 const maxResponseBytes = 1024 * 1024;
 const guid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const name = /^[A-Za-z0-9._-]{1,64}$/;
 // The Entra token is sent to the endpoint, so only Azure AI hosts are accepted, whatever the repository variable says.
 const azureAiHost = /\.(?:services\.ai|cognitiveservices|openai)\.azure\.com$/;
 
-class DecisionTransportError extends Error {}
+class RiskModelTransportError extends Error {}
 
 /** @param {unknown} value @returns {value is Record<string, unknown>} */
 function isRecord(value) {
@@ -22,18 +23,21 @@ function isProbability(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
-/** @param {unknown} payload */
-function validateDecision(payload) {
+/**
+ * @param {unknown} payload
+ * @param {string} expectedModel The model identity the deployment must report, compared case-insensitively.
+ */
+function validateRiskModelAnswer(payload, expectedModel) {
   if (
     !isRecord(payload) ||
     typeof payload.model !== 'string' ||
-    !['microsoft-decision-1', 'Microsoft-Decision-1'].includes(payload.model) ||
+    payload.model.toLowerCase() !== expectedModel.toLowerCase() ||
     !isRecord(payload.answers) ||
     Object.keys(payload.answers).join() !== 'risk_tier' ||
     !isRecord(payload.answers.risk_tier) ||
     !isRecord(payload.usage)
   ) {
-    throw new Error('Decision returned an invalid model, answer binding, or usage.');
+    throw new Error('The risk model returned an invalid model, answer binding, or usage.');
   }
   const answer = payload.answers.risk_tier;
   const distribution = answer.probabilities;
@@ -57,7 +61,7 @@ function validateDecision(payload) {
     Number(usage.input_tokens) < 0 ||
     Number(usage.output_tokens) < 0
   ) {
-    throw new Error('Decision returned an invalid Choice distribution or usage.');
+    throw new Error('The risk model returned an invalid choice distribution or usage.');
   }
   return {
     tier: Number(answer.choice),
@@ -70,10 +74,11 @@ function validateDecision(payload) {
 
 /**
  * @param {{ diff: string; deterministic: { tier: number; reason: string } }} input
+ * @param {string} deployment
  */
-function buildDecisionRequest(input) {
+function buildRiskModelRequest(input, deployment) {
   if (!input.diff.trim()) {
-    throw new Error('Decision requires the complete, nonempty PR diff.');
+    throw new Error('The risk model requires the complete, nonempty PR diff.');
   }
   const body = JSON.stringify({
     model: deployment,
@@ -107,12 +112,12 @@ function buildDecisionRequest(input) {
 async function readBoundedJson(response, limit) {
   if (!response.ok) {
     await response.body?.cancel();
-    throw new DecisionTransportError(
-      `Decision service request failed (HTTP ${response.status}); response content is not logged.`,
+    throw new RiskModelTransportError(
+      `Risk model request failed (HTTP ${response.status}); response content is not logged.`,
     );
   }
   if (!response.body) {
-    throw new DecisionTransportError('Decision service returned no response body.');
+    throw new RiskModelTransportError('The risk model returned no response body.');
   }
   const reader = response.body.getReader();
   const chunks = [];
@@ -125,7 +130,7 @@ async function readBoundedJson(response, limit) {
       }
       bytes += value.byteLength;
       if (bytes > limit) {
-        throw new DecisionTransportError('Decision service response exceeds its byte limit.');
+        throw new RiskModelTransportError('The risk model response exceeds its byte limit.');
       }
       chunks.push(value);
     }
@@ -135,7 +140,7 @@ async function readBoundedJson(response, limit) {
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
-    throw new DecisionTransportError('Decision service returned invalid JSON; response content is not logged.');
+    throw new RiskModelTransportError('The risk model returned invalid JSON; response content is not logged.');
   }
 }
 
@@ -149,35 +154,41 @@ async function requestJson(url, options, fetcher, limit) {
   try {
     return await readBoundedJson(await fetcher(url, options), limit);
   } catch (error) {
-    if (error instanceof DecisionTransportError) {
+    if (error instanceof RiskModelTransportError) {
       throw error;
     }
     const timedOut = isRecord(error) && (error.name === 'TimeoutError' || error.name === 'AbortError');
-    throw new DecisionTransportError(
+    throw new RiskModelTransportError(
       timedOut
-        ? 'Decision service request exceeded its deadline or was aborted.'
-        : 'Decision service transport failed; provider response content is not logged.',
+        ? 'The risk model request exceeded its deadline or was aborted.'
+        : 'The risk model transport failed; provider response content is not logged.',
     );
   }
 }
 
 /**
  * @param {{ diff: string; deterministic: { tier: number; reason: string } }} input
- * @param {{ endpoint: string; getToken: () => Promise<string>; fetcher?: typeof fetch }} transport
+ * @param {{
+ *   endpoint: string;
+ *   deployment: string;
+ *   model: string;
+ *   getToken: () => Promise<string>;
+ *   fetcher?: typeof fetch;
+ * }} transport
  */
-async function decideRisk(input, { endpoint, getToken, fetcher = fetch }) {
-  const body = buildDecisionRequest(input);
+async function askRiskModel(input, { endpoint, deployment, model, getToken, fetcher = fetch }) {
+  const body = buildRiskModelRequest(input, deployment);
   let token;
   try {
     token = await getToken();
   } catch (error) {
-    if (error instanceof DecisionTransportError) {
+    if (error instanceof RiskModelTransportError) {
       throw error;
     }
-    throw new DecisionTransportError('Decision authentication failed; credential error details are not logged.');
+    throw new RiskModelTransportError('Risk model authentication failed; credential error details are not logged.');
   }
   if (!token.trim()) {
-    throw new Error('Decision authentication returned an empty token.');
+    throw new Error('Risk model authentication returned an empty token.');
   }
   const payload = await requestJson(
     endpoint,
@@ -191,26 +202,28 @@ async function decideRisk(input, { endpoint, getToken, fetcher = fetch }) {
     fetcher,
     maxResponseBytes,
   );
-  return validateDecision(payload);
+  return validateRiskModelAnswer(payload, model);
 }
 
 /**
- * @typedef {{ endpoint: string; clientId: string; tenantId: string }} DecisionConfig
+ * @typedef {{ endpoint: string; deployment: string; model: string; clientId: string; tenantId: string }} RiskModelConfig
  */
 
 /**
  * Reads the model configuration from repository settings, not from code.
  *
  * @param {NodeJS.ProcessEnv} env
- * @returns {DecisionConfig | undefined} Undefined when the model is not configured: neither the endpoint nor the
- *   client ID is set. The tenant alone does not count, because the repository's `AZURE_TENANT_ID` secret is shared
- *   with other workflows.
+ * @returns {RiskModelConfig | undefined} Undefined when the model is not configured: none of the endpoint,
+ *   deployment, model identity and client ID is set. The tenant alone does not count, because the repository's
+ *   `AZURE_TENANT_ID` secret is shared with other workflows.
  */
-function getDecisionConfig(env) {
-  const endpoint = env.RISK_DECISION_ENDPOINT || '';
-  const clientId = env.RISK_CLASSIFIER_AZURE_CLIENT_ID || '';
-  const tenantId = env.RISK_CLASSIFIER_AZURE_TENANT_ID || '';
-  if (!endpoint && !clientId) {
+function getRiskModelConfig(env) {
+  const endpoint = env.RISK_MODEL_ENDPOINT || '';
+  const deployment = env.RISK_MODEL_DEPLOYMENT || '';
+  const model = env.RISK_MODEL_ID || '';
+  const clientId = env.RISK_MODEL_AZURE_CLIENT_ID || '';
+  const tenantId = env.RISK_MODEL_AZURE_TENANT_ID || '';
+  if (!endpoint && !deployment && !model && !clientId) {
     return undefined;
   }
   let url;
@@ -224,29 +237,32 @@ function getDecisionConfig(env) {
     url.username ||
     url.password ||
     !azureAiHost.test(url.hostname) ||
+    !name.test(deployment) ||
+    !name.test(model) ||
     !guid.test(clientId) ||
     !guid.test(tenantId)
   ) {
     throw new Error(
-      'The risk model is partly or wrongly configured: set an https Azure AI endpoint and Azure client/tenant IDs.',
+      'The risk model is partly or wrongly configured: set an https Azure AI endpoint, the deployment and model ' +
+        'names, and Azure client/tenant IDs.',
     );
   }
-  return { endpoint, clientId, tenantId };
+  return { endpoint, deployment, model, clientId, tenantId };
 }
 
 /**
  * Exchanges the workflow's GitHub OIDC token for an Entra token, so no long-lived key exists.
  *
  * @param {{ getIDToken: (audience: string) => Promise<string> }} core
- * @param {DecisionConfig} config
+ * @param {RiskModelConfig} config
  * @param {typeof fetch} fetcher
  */
-async function getDecisionToken(core, { clientId, tenantId }, fetcher = fetch) {
+async function getRiskModelToken(core, { clientId, tenantId }, fetcher = fetch) {
   let assertion;
   try {
     assertion = await core.getIDToken('api://AzureADTokenExchange');
   } catch {
-    throw new DecisionTransportError('GitHub OIDC token acquisition failed; assertion details are not logged.');
+    throw new RiskModelTransportError('GitHub OIDC token acquisition failed; assertion details are not logged.');
   }
   const payload = await requestJson(
     `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
@@ -266,9 +282,15 @@ async function getDecisionToken(core, { clientId, tenantId }, fetcher = fetch) {
     32 * 1024,
   );
   if (!isRecord(payload) || typeof payload.access_token !== 'string' || !payload.access_token.trim()) {
-    throw new Error('Decision authentication did not return an access token.');
+    throw new Error('Risk model authentication did not return an access token.');
   }
   return payload.access_token;
 }
 
-module.exports = { buildDecisionRequest, decideRisk, getDecisionConfig, getDecisionToken, validateDecision };
+module.exports = {
+  askRiskModel,
+  buildRiskModelRequest,
+  getRiskModelConfig,
+  getRiskModelToken,
+  validateRiskModelAnswer,
+};
