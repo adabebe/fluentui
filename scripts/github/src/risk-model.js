@@ -108,16 +108,17 @@ function buildRiskModelRequest(input, deployment) {
 /**
  * @param {Response} response
  * @param {number} limit
+ * @param {string} service Names the failing service in content-free errors.
  */
-async function readBoundedJson(response, limit) {
+async function readBoundedJson(response, limit, service) {
   if (!response.ok) {
     await response.body?.cancel();
     throw new RiskModelTransportError(
-      `Risk model request failed (HTTP ${response.status}); response content is not logged.`,
+      `${service} request failed (HTTP ${response.status}); response content is not logged.`,
     );
   }
   if (!response.body) {
-    throw new RiskModelTransportError('The risk model returned no response body.');
+    throw new RiskModelTransportError(`${service} returned no response body.`);
   }
   const reader = response.body.getReader();
   const chunks = [];
@@ -130,7 +131,7 @@ async function readBoundedJson(response, limit) {
       }
       bytes += value.byteLength;
       if (bytes > limit) {
-        throw new RiskModelTransportError('The risk model response exceeds its byte limit.');
+        throw new RiskModelTransportError(`${service} response exceeds its byte limit.`);
       }
       chunks.push(value);
     }
@@ -140,7 +141,7 @@ async function readBoundedJson(response, limit) {
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
-    throw new RiskModelTransportError('The risk model returned invalid JSON; response content is not logged.');
+    throw new RiskModelTransportError(`${service} returned invalid JSON; response content is not logged.`);
   }
 }
 
@@ -149,10 +150,11 @@ async function readBoundedJson(response, limit) {
  * @param {RequestInit} options
  * @param {typeof fetch} fetcher
  * @param {number} limit
+ * @param {string} service
  */
-async function requestJson(url, options, fetcher, limit) {
+async function requestJson(url, options, fetcher, limit, service) {
   try {
-    return await readBoundedJson(await fetcher(url, options), limit);
+    return await readBoundedJson(await fetcher(url, options), limit, service);
   } catch (error) {
     if (error instanceof RiskModelTransportError) {
       throw error;
@@ -160,8 +162,8 @@ async function requestJson(url, options, fetcher, limit) {
     const timedOut = isRecord(error) && (error.name === 'TimeoutError' || error.name === 'AbortError');
     throw new RiskModelTransportError(
       timedOut
-        ? 'The risk model request exceeded its deadline or was aborted.'
-        : 'The risk model transport failed; provider response content is not logged.',
+        ? `${service} request exceeded its deadline or was aborted.`
+        : `${service} transport failed; provider response content is not logged.`,
     );
   }
 }
@@ -201,6 +203,7 @@ async function askRiskModel(input, { endpoint, deployment, model, getToken, fetc
     },
     fetcher,
     maxResponseBytes,
+    'Risk model',
   );
   return validateRiskModelAnswer(payload, model);
 }
@@ -280,6 +283,7 @@ async function getRiskModelToken(core, { clientId, tenantId }, fetcher = fetch) 
     },
     fetcher,
     32 * 1024,
+    'Risk model authentication (Entra token)',
   );
   if (!isRecord(payload) || typeof payload.access_token !== 'string' || !payload.access_token.trim()) {
     throw new Error('Risk model authentication did not return an access token.');

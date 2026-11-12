@@ -166,6 +166,10 @@ describe('risk model assessment', () => {
     expect(request.body.get('scope')).toBe('https://cognitiveservices.azure.com/.default');
     expect(request.body.get('client_assertion')).toBe('test-only-assertion');
     expect(fetcher).toHaveBeenCalledTimes(1);
+    // A rejected token exchange names authentication, not the model, as the failing step.
+    await expect(
+      getRiskModelToken(core, config, jest.fn().mockResolvedValue(new Response('denied', { status: 400 }))),
+    ).rejects.toThrow('Risk model authentication (Entra token) request failed (HTTP 400)');
   });
 
   test('reads the model configuration from settings and rejects partial or unsafe values', () => {
