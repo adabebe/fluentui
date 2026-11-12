@@ -9,24 +9,41 @@ concurrency:
   group: pr-housekeeping-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-  checks: write
-  id-token: write
+# Every job declares only the permissions it needs.
+permissions: {}
 
 jobs:
+  label:
+    name: Label areas
+    # Area labels depend on the changed files only, as before the risk pilot; a pilot failure cannot affect them.
+    if: ${{ github.repository_owner == 'microsoft' && contains(fromJSON('["opened", "synchronize", "reopened"]'), github.event.action) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          repo-token: '${{ secrets.GITHUB_TOKEN }}'
+          sync-labels: true
+          configuration-path: .github/labeler.yml
+
   snapshot:
     name: Prepare risk assessment
     if: ${{ github.repository_owner == 'microsoft' }}
     runs-on: ubuntu-latest
     timeout-minutes: 1
+    permissions:
+      pull-requests: read
+      checks: write
     outputs:
       check-id: ${{ steps.policy.outputs.check-id }}
       base-sha: ${{ steps.policy.outputs.base-sha }}
       identity: ${{ steps.policy.outputs.identity }}
     steps:
+      # Runs before any checkout, so it cannot require risk-policy.js; the identity must equal revisionKey()
+      # (risk-workflow-setup.test.ts checks this).
       - name: Invalidate the previous risk assessment before setup
         id: policy
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -54,20 +71,21 @@ jobs:
             core.setOutput('base-sha', pull.base.sha);
             core.setOutput('identity', identity);
 
-  label:
+  assess:
     # Native job metadata belongs to this trusted run; a custom check name is not provenance.
     name: 'Assess PR #${{ github.event.pull_request.number }} revision ${{ needs.snapshot.outputs.identity }}'
     needs: snapshot
     if: ${{ needs.snapshot.outputs.check-id != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: write
+      # Exchanged for a short-lived Entra token for the optional risk model; there is no stored model key.
+      id-token: write
     steps:
-      - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
-        with:
-          repo-token: '${{ secrets.GITHUB_TOKEN }}'
-          sync-labels: true
-          configuration-path: .github/labeler.yml
-
       # Never check out or execute PR-head code in pull_request_target.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -76,7 +94,6 @@ jobs:
           sparse-checkout: |
             .github/risk-tiers.json
             scripts/github
-            docs/workflows/pr-risk-tiers.md
           sparse-checkout-cone-mode: false
 
       - name: Classify review risk
@@ -84,26 +101,25 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           RISK_POLICY_CHECK_ID: ${{ needs.snapshot.outputs.check-id }}
-          RISK_POLICY_BASE_SHA: ${{ needs.snapshot.outputs.base-sha }}
           RISK_POLICY_IDENTITY: ${{ needs.snapshot.outputs.identity }}
+          RISK_DECISION_ENDPOINT: ${{ vars.RISK_DECISION_ENDPOINT }}
+          RISK_MODEL_MODE: ${{ vars.RISK_MODEL_MODE }}
           RISK_CLASSIFIER_AZURE_CLIENT_ID: ${{ vars.RISK_CLASSIFIER_AZURE_CLIENT_ID }}
           RISK_CLASSIFIER_AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         with:
           script: |
             const run = require(`${process.env.GITHUB_WORKSPACE}/scripts/github/src/risk-tiers-workflow.js`);
-            const pull = context.payload.pull_request;
             await run({
               github, context, core,
               checkRun: {
                 id: Number(process.env.RISK_POLICY_CHECK_ID),
-                headSha: pull.head.sha,
-                baseSha: process.env.RISK_POLICY_BASE_SHA,
                 identity: process.env.RISK_POLICY_IDENTITY,
               },
             });
 
+      # A missing Review focus line also fails the classify step (so the gate fails); its check is already complete.
       - name: Fail the risk check if setup or classification did not finish
-        if: ${{ always() && steps.classify.outcome != 'success' }}
+        if: ${{ always() && steps.classify.outputs.check-completed != 'true' }}
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           RISK_POLICY_CHECK_ID: ${{ needs.snapshot.outputs.check-id }}

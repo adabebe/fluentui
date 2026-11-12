@@ -13,12 +13,31 @@ const scripts = Array.from(workflow.matchAll(/^ {10}script: \|\n((?: {12}[^\n]*\
 describe('trusted risk workflow setup', () => {
   test('invalidates before all fallible setup and has only one risk-label writer', () => {
     expect(scripts).toHaveLength(3);
-    expect(workflow.indexOf('id: policy')).toBeLessThan(workflow.indexOf('uses: actions/labeler'));
     expect(workflow.indexOf('id: policy')).toBeLessThan(workflow.indexOf('uses: actions/checkout'));
     expect(workflow).not.toContain('configuration-path: .github/risk-tiers.json');
-    expect(workflow).toContain("always() && steps.classify.outcome != 'success'");
+    // The finalizer must not overwrite a completed check, e.g. one that failed for a missing Review focus line.
+    expect(workflow).toContain("always() && steps.classify.outputs.check-completed != 'true'");
     expect(workflow).toContain('ref: ${{ needs.snapshot.outputs.base-sha }}');
     expect(workflow).toContain('persist-credentials: false');
+  });
+
+  test('grants each job only the permissions it needs', () => {
+    const job = (name: string) => {
+      const start = workflow.indexOf(`\n  ${name}:\n`);
+      const next = workflow.slice(start + 1).search(/\n {2}[a-z]+:\n/);
+      return workflow.slice(start, next < 0 ? undefined : start + 1 + next);
+    };
+    expect(workflow).toContain('\npermissions: {}\n');
+    expect(job('label')).not.toMatch(/id-token|checks:/);
+    expect(job('snapshot')).toContain('pull-requests: read');
+    expect(job('snapshot')).not.toMatch(/id-token|issues:|contents:/);
+    expect(job('assess')).toContain('id-token: write');
+  });
+
+  test('area labels do not depend on the risk pilot', () => {
+    const label = workflow.slice(workflow.indexOf('\n  label:'), workflow.indexOf('\n  snapshot:'));
+    expect(label).toContain('uses: actions/labeler');
+    expect(label).not.toContain('needs:');
   });
 
   test('binds native run/job metadata to the PR and trusted bootstrap revision', () => {

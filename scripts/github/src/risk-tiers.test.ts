@@ -1,17 +1,14 @@
 /* eslint-disable @typescript-eslint/naming-convention -- GitHub REST API fixtures use upstream field names. */
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
 import { revisionKey } from './risk-policy';
 import type { ChangedFile } from './risk-tiers';
-import { classifyRisk, hasReviewFocus, tierLabels } from './risk-tiers';
+import { classifyRisk, hasReviewFocus, rules, tierLabels } from './risk-tiers';
 
-const rules = JSON.parse(readFileSync(join(__dirname, '../../../.github/risk-tiers.json'), 'utf8'));
 const runWorkflow = require('./risk-tiers-workflow');
 
 const source = 'packages/react-components/react-button/library/src/Button.tsx';
 const story = 'packages/react-components/react-button/stories/Button.stories.tsx';
-const pull = { author: 'contributor', title: 'fix(button): correct behavior' };
+const changeFile = 'change/@fluentui-react-button-1234.json';
+const test_ = 'packages/react-components/react-button/library/src/Button.test.tsx';
 const file = (filename: string, additions = 1, deletions = 0, previousFilename?: string) => ({
   filename,
   status: 'modified',
@@ -20,14 +17,12 @@ const file = (filename: string, additions = 1, deletions = 0, previousFilename?:
   previous_filename: previousFilename,
   patch: '@@ -1 +1 @@\n-old\n+new',
 });
-const tier = (files: ChangedFile[], metadata = pull) => classifyRisk(files, metadata).tier;
+const tier = (files: ChangedFile[]) => classifyRisk(files, { changedFiles: files.length }).tier;
 
 describe('risk classification', () => {
   test('keeps the positive trivial allowlist small and excludes broad Markdown matches', () => {
-    const globs: string[] = rules['Risk: trivial'][0]['changed-files'][0]['any-glob-to-all-files'];
-    expect(globs).toHaveLength(1);
-    expect(globs[0].split(',').length).toBeLessThanOrEqual(15);
-    expect(globs.every(glob => !glob.startsWith('!') && glob !== '**/*.md')).toBe(true);
+    expect(rules.trivial.length).toBeLessThanOrEqual(15);
+    expect(rules.trivial.every(glob => !glob.startsWith('!') && !glob.endsWith('**/*.md'))).toBe(true);
   });
 
   test('matches the union of story and documentation paths across packages', () => {
@@ -51,6 +46,8 @@ describe('risk classification', () => {
 
   test.each([
     'packages/react-components/react-button/etc/react-button.api.md',
+    'packages/react-components/react-button/library/etc/react-button.api.md',
+    'packages/web-components/docs/web-components.api.md',
     'packages/react-components/react-button/package.json',
     'package.json',
     '.github/risk-tiers.json',
@@ -106,40 +103,122 @@ describe('risk classification', () => {
     expect(tier([file(path, 500)])).toBe(1);
   });
 
-  test('counts added plus deleted lines, not net changes', () => {
+  test('counts added plus deleted source lines, not net changes', () => {
     expect(tier([file(source, 25, 25)])).toBe(1);
     expect(tier([file(source, 26, 25)])).toBe(2);
     expect(tier([file(source, 25), file(source.replace('Button.tsx', 'useButton.ts'), 25)])).toBe(1);
     expect(tier([file(source, 25), file(source.replace('Button.tsx', 'useButton.ts'), 26)])).toBe(2);
   });
 
-  test('requires a fix claim and one package source root', () => {
-    expect(tier([file(source)], { ...pull, title: 'feat(button): new feature' })).toBe(2);
-    expect(tier([file(source)], { ...pull, title: 'fix!: breaking change' })).toBe(2);
+  test('a small fix may carry its change file, which does not count; its tests count', () => {
+    expect(tier([file(source, 9), file(changeFile, 7)])).toBe(1);
+    expect(tier([file(source, 50), file(changeFile, 7)])).toBe(1);
+    expect(tier([file(source, 51), file(changeFile, 7)])).toBe(2);
+    expect(tier([file(source, 9), file(test_, 41), file(changeFile, 7)])).toBe(1);
+    expect(tier([file(source, 9), file(test_, 42)])).toBe(2);
+  });
+
+  test('small fixes are limited to library/src and the web components source', () => {
+    expect(tier([file('packages/web-components/src/switch/switch.styles.ts', 4), file(changeFile, 7)])).toBe(1);
+    expect(tier([file('packages/charts/react-charts/library/src/components/Chart.ts', 3)])).toBe(1);
+    // Tooling, legacy v8 and core runtime packages keep their source in src/ and are not fast-lane material.
+    for (const path of [
+      'packages/eslint-plugin/src/rules/a.js',
+      'packages/react-components/babel-preset-global-context/src/index.ts',
+      'packages/react-components/react-jsx-runtime/src/index.ts',
+      'packages/react-file-type-icons/src/FileTypeIconMap.ts',
+      'packages/react-components/react-button/stories/src/Button/Default.tsx',
+    ]) {
+      expect(tier([file(path, 2), file(changeFile, 7)])).toBe(2);
+    }
+  });
+
+  test('a listed protected path wins over an incomplete listing', () => {
+    expect(classifyRisk([file('.github/workflows/pr.yml'), file('package.json')], { changedFiles: 5000 }).tier).toBe(3);
+  });
+
+  test('newlines in paths cannot escape protected directories', () => {
+    expect(tier([file('.github/workflows/a\nb.yml')])).toBe(3);
+    expect(tier([file('packages/react-components/react-theme/library/src/a\nb.ts')])).toBe(3);
+  });
+
+  test('a file renamed into change/ is still reviewed by its old path', () => {
+    expect(
+      tier([
+        file(source, 2),
+        file('change/x.json', 0, 0, 'packages/react-components/react-input/library/src/Input.tsx'),
+      ]),
+    ).toBe(2);
+  });
+
+  test('a file without a text diff keeps any change out of the fast lane, except binary snapshots', () => {
+    expect(tier([{ ...file('packages/react-components/react-button/stories/assets/icon.png', 0), patch: '' }])).toBe(2);
+    expect(tier([{ ...file(story, 0, 0, story.replace('Button.stories', 'Old.stories')), patch: undefined }])).toBe(2);
+    expect(
+      tier([{ ...file('packages/react-components/react-button/stories/__snapshots__/Button.png', 0), patch: '' }]),
+    ).toBe(1);
+  });
+
+  test('a small fix stays in one package source root and needs text patches', () => {
     expect(tier([file(source), file(source.replace('react-button', 'react-input'))])).toBe(2);
-    expect(tier([file(source), file('change/react-button.json')])).toBe(2);
+    expect(tier([file(source), file(story)])).toBe(2);
+    expect(tier([file('packages/react-components/react-button/library/config/tests.js')])).toBe(2);
     expect(tier([{ ...file(source), patch: undefined }])).toBe(2);
     expect(tier([{ ...file(source), patch: '' }])).toBe(2);
     expect(tier([file(source.replace('Button.tsx', '__snapshots__/helper.ts'), 51)])).toBe(2);
+    expect(tier([file(changeFile, 7)])).toBe(2);
   });
 
-  test('Dependabot cannot use either fast lane', () => {
-    const dependabot = { ...pull, author: 'dependabot[bot]' };
-    expect(tier([file(story)], dependabot)).toBe(2);
-    expect(tier([file(source)], dependabot)).toBe(2);
-    expect(tier([file('package.json')], dependabot)).toBe(3);
+  test('a change file keeps docs and stories out of tier 0', () => {
+    expect(tier([file(story), file(changeFile)])).toBe(2);
   });
 
-  test('fails explicitly on empty or invalid file metadata', () => {
-    expect(() => tier([])).toThrow('empty');
+  test('hidden files never qualify as stories or documentation', () => {
+    expect(tier([file('packages/react-components/react-button/stories/.eslintrc.js')])).toBe(2);
+    expect(tier([file('packages/react-components/react-button/library/docs/.notes.md')])).toBe(2);
+  });
+
+  test('Cypress component tests count as tests', () => {
+    expect(tier([file('packages/react-components/react-drawer/library/src/Drawer.cy.tsx', 300)])).toBe(1);
+  });
+
+  test('typical Dependabot changes are protected without reading the author', () => {
+    expect(tier([file('package.json'), file('yarn.lock')])).toBe(3);
+    expect(tier([file('.github/workflows/pr.yml')])).toBe(3);
+  });
+
+  test('labels an empty or truncated listing as standard instead of guessing', () => {
+    expect(classifyRisk([], { changedFiles: 0 }).tier).toBe(2);
+    expect(classifyRisk([file(story)], { changedFiles: 2 }).tier).toBe(2);
+    expect(
+      classifyRisk(
+        Array.from({ length: 3000 }, () => file(story)),
+        { changedFiles: 3000 },
+      ).tier,
+    ).toBe(2);
+  });
+
+  test('fails explicitly on invalid file metadata', () => {
     expect(() => tier([file(source, -1)])).toThrow('metadata');
     expect(() => tier([file(source, Number.NaN)])).toThrow('metadata');
+  });
+
+  test('rejects glob syntax the matcher does not support', () => {
+    jest.isolateModules(() => {
+      jest.doMock('node:fs', () => ({
+        readFileSync: () => JSON.stringify({ trivial: [], protected: ['{a,b}/**'] }),
+      }));
+      expect(() => require('./risk-tiers')).toThrow('Unsupported syntax');
+    });
+    jest.dontMock('node:fs');
   });
 
   test('review focus must be actual prose, not a template comment or code sample', () => {
     expect(hasReviewFocus('Review focus: Check the API compatibility.')).toBe(true);
     expect(hasReviewFocus('Review focus: x')).toBe(true);
     expect(hasReviewFocus('**Review focus:** Check keyboard navigation.')).toBe(true);
+    expect(hasReviewFocus('**Review focus:**')).toBe(false);
+    expect(hasReviewFocus('**Review focus:**   ')).toBe(false);
     expect(hasReviewFocus('<!-- Review focus: placeholder -->')).toBe(false);
     expect(hasReviewFocus('```\nReview focus: example\n```')).toBe(false);
     expect(hasReviewFocus('Review focus:  ')).toBe(false);
@@ -148,12 +227,22 @@ describe('risk classification', () => {
   });
 });
 
+const diffText = 'diff --git a/example b/example\n+change';
+const config = { tenantId: '22222222-2222-2222-2222-222222222222' };
+const decision = (suggested: number) => ({
+  tier: suggested,
+  model: 'microsoft-decision-1',
+  confidence: 0.9,
+  inputTokens: 100,
+  outputTokens: 1,
+});
+
 function workflowFixture(paths = [file(source)]) {
   const data = {
     head: { sha: 'head-sha' },
     base: { sha: 'base-sha', ref: 'master', repo: { full_name: 'microsoft/fluentui' } },
-    user: { login: pull.author },
-    title: pull.title,
+    author_association: 'MEMBER',
+    title: 'fix(button): correct behavior',
     body: 'Review focus: Confirm the intended behavior.',
     changed_files: paths.length,
     labels: tierLabels.map(name => ({ name })).concat([{ name: 'CI' }]),
@@ -161,61 +250,61 @@ function workflowFixture(paths = [file(source)]) {
   const github = {
     rest: {
       pulls: {
-        get: jest.fn().mockImplementation(params =>
-          Promise.resolve({
-            data: params.mediaType?.format === 'diff' ? 'diff --git a/example b/example\n+change' : data,
-          }),
-        ),
+        get: jest
+          .fn()
+          .mockImplementation(params =>
+            Promise.resolve({ data: params.mediaType?.format === 'diff' ? diffText : data }),
+          ),
         listFiles: jest.fn(),
       },
       issues: { addLabels: jest.fn(), removeLabel: jest.fn() },
-      checks: { create: jest.fn().mockResolvedValue({ data: { id: 456 } }), update: jest.fn() },
+      checks: { update: jest.fn() },
     },
     paginate: jest.fn().mockResolvedValue(paths),
   };
   const core = {
     summary: { addRaw: jest.fn().mockReturnThis(), write: jest.fn() },
     setFailed: jest.fn(),
+    setOutput: jest.fn(),
   };
   return {
     data,
     github,
     core,
-    assessRisk: jest.fn().mockResolvedValue({
-      tier: 0,
-      model: 'microsoft-decision-1',
-      confidence: 0.9,
-      inputTokens: 100,
-      outputTokens: 1,
-    }),
+    env: { RISK_MODEL_MODE: 'raise' } as Record<string, string>,
+    assessRisk: jest.fn().mockResolvedValue(decision(0)),
+    checkRun: { id: 456, identity: revisionKey(data) },
     context: { repo: { owner: 'microsoft', repo: 'fluentui' }, issue: { number: 123 } },
   };
 }
 
+type Fixture = ReturnType<typeof workflowFixture>;
+const labelsAdded = (args: Fixture) => args.github.rest.issues.addLabels.mock.calls.map(([arg]) => arg.labels[0]);
+const conclusion = (args: Fixture) => args.github.rest.checks.update.mock.calls.at(-1)?.[0].conclusion;
+const summary = (args: Fixture) => args.github.rest.checks.update.mock.calls.at(-1)?.[0].output.summary;
+
 describe('risk workflow', () => {
-  test('paginates, reconciles only risk labels, and certifies the exact head SHA', async () => {
+  test('paginates, reconciles only risk labels, and completes the bootstrap check', async () => {
     const args = workflowFixture();
     await runWorkflow(args);
     expect(args.github.paginate).toHaveBeenCalledWith(
       args.github.rest.pulls.listFiles,
       expect.objectContaining({ per_page: 100 }),
     );
-    expect(args.github.rest.issues.addLabels).toHaveBeenCalledWith(expect.objectContaining({ labels: ['Risk: low'] }));
+    expect(labelsAdded(args)).toEqual(['Risk: low']);
     expect(args.github.rest.issues.removeLabel.mock.calls.map(([arg]) => arg.name)).toEqual([
       'Risk: trivial',
       'Risk: standard',
       'Risk: high',
     ]);
-    expect(args.github.rest.checks.create).toHaveBeenCalledWith(
-      expect.objectContaining({ head_sha: 'head-sha', name: 'PR risk assessment', status: 'in_progress' }),
-    );
     expect(args.github.rest.checks.update).toHaveBeenCalledWith(
       expect.objectContaining({ check_run_id: 456, conclusion: 'success' }),
     );
+    expect(args.core.setOutput).toHaveBeenCalledWith('check-completed', 'true');
   });
 
   test('requires review focus for tiers 2 and 3, but not tiers 0 and 1', async () => {
-    for (const [path, conclusion] of [
+    for (const [path, expected] of [
       [story, 'success'],
       [source, 'success'],
       ['apps/example/index.ts', 'failure'],
@@ -223,34 +312,32 @@ describe('risk workflow', () => {
     ]) {
       const args = workflowFixture([file(path)]);
       args.data.body = '';
+      args.checkRun.identity = revisionKey(args.data);
       await runWorkflow(args);
-      expect(args.github.rest.checks.update).toHaveBeenCalledWith(expect.objectContaining({ conclusion }));
-      expect(args.core.setFailed).toHaveBeenCalledTimes(conclusion === 'failure' ? 1 : 0);
+      expect(conclusion(args)).toBe(expected);
+      expect(args.core.setFailed).toHaveBeenCalledTimes(expected === 'failure' ? 1 : 0);
+      // The check is complete either way, so the workflow finalizer must not overwrite it.
+      expect(args.core.setOutput).toHaveBeenCalledWith('check-completed', 'true');
     }
   });
 
-  test('refuses truncated listings, including the GitHub file limit', async () => {
-    for (const count of [2, 3000]) {
-      const args = workflowFixture();
-      args.data.changed_files = count;
-      if (count === 3000) {
-        args.github.paginate.mockResolvedValue(Array.from({ length: count }, () => file(source)));
-      }
-      await expect(runWorkflow(args)).rejects.toThrow('complete diff');
-      expect(args.github.rest.issues.addLabels).not.toHaveBeenCalled();
-      expect(args.github.rest.checks.update).toHaveBeenCalledWith(expect.objectContaining({ conclusion: 'failure' }));
-    }
+  test('labels a truncated listing as standard', async () => {
+    const args = workflowFixture();
+    args.data.changed_files = 2;
+    args.checkRun.identity = revisionKey(args.data);
+    await runWorkflow(args);
+    expect(labelsAdded(args)).toEqual(['Risk: standard']);
   });
 
   test.each(['head', 'body', 'title'])('does not certify concurrent changes to %s', async key => {
     const args = workflowFixture();
     args.github.rest.pulls.get
       .mockResolvedValueOnce({ data: args.data })
-      .mockResolvedValueOnce({ data: 'diff --git a/example b/example\n+change' })
+      .mockResolvedValueOnce({ data: diffText })
       .mockResolvedValueOnce({ data: { ...args.data, [key]: key === 'head' ? { sha: 'new-head' } : 'edited' } });
     await expect(runWorkflow(args)).rejects.toThrow('changed during classification');
     expect(args.github.rest.issues.addLabels).not.toHaveBeenCalled();
-    expect(args.github.rest.checks.update).toHaveBeenCalledWith(expect.objectContaining({ conclusion: 'failure' }));
+    expect(conclusion(args)).toBe('failure');
   });
 
   test.each([
@@ -261,47 +348,24 @@ describe('risk workflow', () => {
     const args = workflowFixture();
     args.github.rest.pulls.get
       .mockResolvedValueOnce({ data: args.data })
-      .mockResolvedValueOnce({ data: 'diff --git a/example b/example\n+change' })
+      .mockResolvedValueOnce({ data: diffText })
       .mockResolvedValueOnce({ data: { ...args.data, base } });
     await expect(runWorkflow(args)).rejects.toThrow('changed during classification');
     expect(args.github.rest.issues.addLabels).not.toHaveBeenCalled();
   });
 
-  test('updates the bootstrap check rather than creating a second check', async () => {
+  test.each([
+    ['a stale revision', { id: 456, identity: 'old-identity' }],
+    ['an invalid check id', { id: 0, identity: '' }],
+  ])('rejects %s before calling the model or changing labels', async (_, checkRun) => {
     const args = workflowFixture();
-    await runWorkflow({
-      ...args,
-      checkRun: {
-        id: 789,
-        headSha: 'head-sha',
-        baseSha: 'base-sha',
-        identity: revisionKey(args.data),
-      },
-    });
-    expect(args.github.rest.checks.create).not.toHaveBeenCalled();
-    expect(args.github.rest.checks.update).toHaveBeenCalledWith(
-      expect.objectContaining({ check_run_id: 789, conclusion: 'success' }),
-    );
-  });
-
-  test('rejects stale workflow events before calling the provider or changing labels', async () => {
-    const args = workflowFixture();
-    await expect(
-      runWorkflow({
-        ...args,
-        checkRun: {
-          id: 789,
-          headSha: 'head-sha',
-          baseSha: 'old-base',
-          identity: revisionKey(args.data),
-        },
-      }),
-    ).rejects.toThrow('trusted workflow revision');
+    if (checkRun.id === 0) {
+      checkRun.identity = revisionKey(args.data);
+    }
+    await expect(runWorkflow({ ...args, checkRun })).rejects.toThrow('trusted workflow revision');
     expect(args.assessRisk).not.toHaveBeenCalled();
     expect(args.github.rest.issues.addLabels).not.toHaveBeenCalled();
-    expect(args.github.rest.checks.update).toHaveBeenCalledWith(
-      expect.objectContaining({ check_run_id: 789, conclusion: 'failure' }),
-    );
+    expect(conclusion(args)).toBe('failure');
   });
 
   test('does not remove labels or report success if adding the new label fails', async () => {
@@ -309,7 +373,7 @@ describe('risk workflow', () => {
     args.github.rest.issues.addLabels.mockRejectedValue(new Error('API unavailable'));
     await expect(runWorkflow(args)).rejects.toThrow('API unavailable');
     expect(args.github.rest.issues.removeLabel).not.toHaveBeenCalled();
-    expect(args.github.rest.checks.update).toHaveBeenCalledWith(expect.objectContaining({ conclusion: 'failure' }));
+    expect(conclusion(args)).toBe('failure');
   });
 
   test('keeps API failures visible as failed policy checks', async () => {
@@ -317,55 +381,144 @@ describe('risk workflow', () => {
     args.github.paginate.mockRejectedValue(new Error('API unavailable'));
     await expect(runWorkflow(args)).rejects.toThrow('API unavailable');
     expect(args.github.rest.issues.addLabels).not.toHaveBeenCalled();
-    expect(args.github.rest.checks.update).toHaveBeenCalledWith(expect.objectContaining({ conclusion: 'failure' }));
+    expect(conclusion(args)).toBe('failure');
   });
 
-  test('the model can escalate, but never downgrade, the deterministic result', async () => {
-    const args = workflowFixture([file(story)]);
-    args.assessRisk.mockResolvedValue({
-      tier: 3,
-      model: 'microsoft-decision-1',
-      confidence: 0.7,
-      inputTokens: 100,
-      outputTokens: 1,
-    });
-    await runWorkflow(args);
-    expect(args.github.rest.issues.addLabels).toHaveBeenCalledWith(expect.objectContaining({ labels: ['Risk: high'] }));
-    expect(args.assessRisk).toHaveBeenCalledWith(
-      expect.objectContaining({ deterministic: expect.objectContaining({ tier: 0 }) }),
-    );
-
-    const standard = workflowFixture([file('apps/example/index.ts')]);
-    await runWorkflow(standard);
-    expect(standard.github.rest.issues.addLabels).toHaveBeenCalledWith(
-      expect.objectContaining({ labels: ['Risk: standard'] }),
-    );
-  });
-
-  test('deterministic high risk needs no provider call', async () => {
+  test('deterministic high risk needs no model call or diff', async () => {
     const args = workflowFixture([file('AGENTS.md')]);
     await runWorkflow(args);
     expect(args.assessRisk).not.toHaveBeenCalled();
     expect(args.github.rest.pulls.get).toHaveBeenCalledTimes(2);
+    expect(labelsAdded(args)).toEqual(['Risk: high']);
   });
 
-  test('model failures do not silently fall back to deterministic fast-lane labels', async () => {
+  test.each([0, 1, 2].flatMap(floor => [0, 1, 2, 3].map(suggestion => [floor, suggestion])))(
+    'enforces deterministic floor %i against model tier %i',
+    async (floor, suggestion) => {
+      const args = workflowFixture([file([story, source, 'apps/example/index.ts'][floor])]);
+      args.assessRisk.mockResolvedValue(decision(suggestion));
+      await runWorkflow(args);
+      expect(labelsAdded(args)).toEqual([tierLabels[Math.max(floor, suggestion)]]);
+    },
+  );
+
+  test('model escalation also escalates the required human review focus', async () => {
     const args = workflowFixture([file(story)]);
-    args.assessRisk.mockRejectedValue(new Error('Decision unavailable'));
-    await expect(runWorkflow(args)).rejects.toThrow('Decision unavailable');
-    expect(args.github.rest.issues.addLabels).not.toHaveBeenCalled();
-    expect(args.github.rest.checks.update).toHaveBeenCalledWith(expect.objectContaining({ conclusion: 'failure' }));
-  });
-
-  test('unavailable patches cannot enter the fast lane even if the model selects trivial', async () => {
-    const args = workflowFixture([{ ...file(story), patch: '' }]);
+    args.data.body = '';
+    args.checkRun.identity = revisionKey(args.data);
+    args.assessRisk.mockResolvedValue(decision(2));
     await runWorkflow(args);
-    expect(args.github.rest.issues.addLabels).toHaveBeenCalledWith(
-      expect.objectContaining({ labels: ['Risk: standard'] }),
-    );
+    expect(args.core.setFailed).toHaveBeenCalledTimes(1);
+    expect(conclusion(args)).toBe('failure');
   });
 
-  test('renamed binaries with unavailable patches cannot bypass the standard floor', async () => {
+  test.each([
+    ['provider failure', new Error('Decision unavailable')],
+    ['oversized diff', new Error('The diff is too large for the model (48 KiB request limit)')],
+  ])('a %s still labels the PR, but never in the fast lane', async (_, error) => {
+    for (const [path, expected] of [
+      [story, 'Risk: standard'],
+      [source, 'Risk: standard'],
+      ['apps/example/index.ts', 'Risk: standard'],
+    ]) {
+      const args = workflowFixture([file(path)]);
+      args.assessRisk.mockRejectedValue(error);
+      await runWorkflow(args);
+      expect(labelsAdded(args)).toEqual([expected]);
+      expect(summary(args)).toContain(`Model could not assess the change (${error.message})`);
+    }
+  });
+
+  test('a broken model configuration fails every model call instead of disabling the model', async () => {
+    const args = workflowFixture([file(story)]);
+    await runWorkflow({
+      ...args,
+      assessRisk: undefined,
+      env: { ...args.env, RISK_DECISION_ENDPOINT: 'http://insecure.test' },
+    });
+    expect(labelsAdded(args)).toEqual(['Risk: standard']);
+    expect(summary(args)).toContain('partly or wrongly configured');
+  });
+
+  test('shadow mode, the default, reports the model without changing the label', async () => {
+    const args = workflowFixture([file(source)]);
+    args.assessRisk.mockResolvedValue(decision(3));
+    await runWorkflow({ ...args, env: {} });
+    expect(labelsAdded(args)).toEqual(['Risk: low']);
+    expect(summary(args)).toContain('Shadow mode, not applied: with the model this would be tier 3.');
+
+    const failing = workflowFixture([file(source)]);
+    failing.assessRisk.mockRejectedValue(new Error('Decision unavailable'));
+    await runWorkflow({ ...failing, env: { RISK_MODEL_MODE: 'shadow' } });
+    expect(labelsAdded(failing)).toEqual(['Risk: low']);
+    expect(summary(failing)).toContain('Model could not assess the change (Decision unavailable). The deterministic');
+  });
+
+  test('a failure to fetch the diff is a model failure, not a workflow failure', async () => {
+    const args = workflowFixture([file(story)]);
+    args.github.rest.pulls.get.mockImplementation(params =>
+      params.mediaType ? Promise.reject(new Error('diff unavailable')) : Promise.resolve({ data: args.data }),
+    );
+    await runWorkflow(args);
+    expect(labelsAdded(args)).toEqual(['Risk: standard']);
+    expect(summary(args)).toContain('Model could not assess the change (diff unavailable)');
+  });
+
+  test('a failed classification keeps its specific check text', async () => {
+    const args = workflowFixture();
+    args.github.paginate.mockRejectedValue(new Error('API unavailable'));
+    await expect(runWorkflow(args)).rejects.toThrow('API unavailable');
+    expect(args.github.rest.checks.update).toHaveBeenLastCalledWith(
+      expect.objectContaining({ output: expect.objectContaining({ title: 'Risk classification failed' }) }),
+    );
+    expect(args.core.setOutput).toHaveBeenCalledWith('check-completed', 'true');
+  });
+
+  test('without a configured model, shadow mode keeps the deterministic tier and raise mode leaves the fast lane', async () => {
+    const shadow = workflowFixture([file(story)]);
+    // The repository's shared AZURE_TENANT_ID secret alone does not configure the model.
+    await runWorkflow({ ...shadow, assessRisk: undefined, env: { RISK_CLASSIFIER_AZURE_TENANT_ID: config.tenantId } });
+    expect(labelsAdded(shadow)).toEqual(['Risk: trivial']);
+    expect(summary(shadow)).toContain('Model not configured. The deterministic tier stands.');
+
+    const raise = workflowFixture([file(story)]);
+    await runWorkflow({ ...raise, assessRisk: undefined });
+    expect(labelsAdded(raise)).toEqual(['Risk: standard']);
+    expect(summary(raise)).toContain('Model not configured. A fast-lane tier needs a model assessment');
+  });
+
+  test("an outside contributor's PR gets the model only after a maintainer adds ai-review", async () => {
+    for (const [env, expected] of [
+      [{}, 'Risk: trivial'],
+      [{ RISK_MODEL_MODE: 'raise' }, 'Risk: standard'],
+    ] as const) {
+      const args = workflowFixture([file(story)]);
+      args.data.author_association = 'CONTRIBUTOR';
+      args.checkRun.identity = revisionKey(args.data);
+      await runWorkflow({ ...args, env });
+      expect(args.assessRisk).not.toHaveBeenCalled();
+      expect(labelsAdded(args)).toEqual([expected]);
+      expect(summary(args)).toContain('outside contributor');
+    }
+
+    const labeled = workflowFixture([file(story)]);
+    labeled.data.author_association = 'FIRST_TIME_CONTRIBUTOR';
+    labeled.data.labels.push({ name: 'ai-review' });
+    labeled.checkRun.identity = revisionKey(labeled.data);
+    labeled.assessRisk.mockResolvedValue(decision(3));
+    await runWorkflow(labeled);
+    expect(labelsAdded(labeled)).toEqual(['Risk: high']);
+  });
+
+  test('a trusted author with the ai-review label gets the model once', async () => {
+    const args = workflowFixture([file(story)]);
+    args.data.labels.push({ name: 'ai-review' });
+    args.checkRun.identity = revisionKey(args.data);
+    await runWorkflow(args);
+    expect(args.assessRisk).toHaveBeenCalledTimes(1);
+  });
+
+  test('files without a text diff keep the change out of the fast lane even if the model selects trivial', async () => {
     const args = workflowFixture([
       {
         ...file(
@@ -378,50 +531,8 @@ describe('risk workflow', () => {
         patch: '',
       },
     ]);
-    args.github.rest.pulls.get.mockImplementation(params =>
-      Promise.resolve({
-        data:
-          params.mediaType?.format === 'diff'
-            ? 'diff --git a/before.png b/after.png\nsimilarity index 90%\nBinary files a/before.png and b/after.png differ\n'
-            : args.data,
-      }),
-    );
     await runWorkflow(args);
-    expect(args.github.rest.issues.addLabels).toHaveBeenCalledWith(
-      expect.objectContaining({ labels: ['Risk: standard'] }),
-    );
-  });
-
-  test.each([0, 1, 2].flatMap(floor => [0, 1, 2, 3].map(suggestion => [floor, suggestion])))(
-    'enforces deterministic floor %i against model tier %i',
-    async (floor, suggestion) => {
-      const args = workflowFixture([file([story, source, 'apps/example/index.ts'][floor])]);
-      args.assessRisk.mockResolvedValue({
-        tier: suggestion,
-        model: 'microsoft-decision-1',
-        confidence: 0.9,
-        inputTokens: 100,
-        outputTokens: 1,
-      });
-      await runWorkflow(args);
-      expect(args.github.rest.issues.addLabels).toHaveBeenCalledWith(
-        expect.objectContaining({ labels: [tierLabels[Math.max(floor, suggestion)]] }),
-      );
-    },
-  );
-
-  test('model escalation also escalates the required human review focus', async () => {
-    const args = workflowFixture([file(story)]);
-    args.data.body = '';
-    args.assessRisk.mockResolvedValue({
-      tier: 2,
-      model: 'microsoft-decision-1',
-      confidence: 0.9,
-      inputTokens: 100,
-      outputTokens: 1,
-    });
-    await runWorkflow(args);
-    expect(args.core.setFailed).toHaveBeenCalledTimes(1);
-    expect(args.github.rest.checks.update).toHaveBeenCalledWith(expect.objectContaining({ conclusion: 'failure' }));
+    expect(args.assessRisk).toHaveBeenCalled();
+    expect(labelsAdded(args)).toEqual(['Risk: standard']);
   });
 });
