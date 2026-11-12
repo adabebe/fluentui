@@ -39,8 +39,10 @@ paths and never add a broad `**/*.md` rule: agent instructions must not enter th
 lane. Both lists use one matcher that supports literal paths plus `*` and `**`;
 unsupported pattern syntax fails explicitly instead of silently weakening a rule.
 Wildcards match hidden names, so a protected directory covers its hidden files, while
-hidden files never count as trivial. `AGENTS.override.md` is protected alongside
-`AGENTS.md`. Tier labels and criteria are defined once, in `risk-tiers.js`; the model
+hidden files never count as trivial. Protected globs ignore case, so `agents.md` counts as
+`AGENTS.md`; `AGENTS.override.md` is protected alongside it. Trivial stories are the
+package-level `stories/src/` folders only, and configuration files (`*.config.*`) never
+count as trivial. Tier labels and criteria are defined once, in `risk-tiers.js`; the model
 receives the same criteria.
 
 The classifier is the only writer of the four mutually exclusive `Risk:` labels,
@@ -49,7 +51,10 @@ labeler runs in its own job with its own permissions, does not publish risk labe
 and does not depend on the pilot. It considers old and new
 filenames for renames. An incomplete file list is labeled tier 2; API errors fail
 the workflow rather than certify a tier. The `PR risk assessment` check is attached to the classified head
-SHA and fails if a tier 2/3 description lacks a nonempty `Review focus: ...` line.
+SHA. In this label-only pilot it always succeeds once classification finishes; for tier 2/3 it
+reminds the author to add a nonempty `Review focus: ...` line (a list bullet and bold are
+accepted). The check's `text` holds one JSON record per assessment (final, deterministic and
+model tier, confidence, mode, review focus present) for measuring the pilot.
 The description should identify API/consumer contracts, intent/design, accessibility,
 or trust boundaries that need human attention. Authors verify every claim and report
 real evidence, or explicitly say "not run".
@@ -88,9 +93,8 @@ Reclassification runs on pushes, description
 edits, reopening, and readiness changes.
 
 Labels are routing hints, **not merge authorization**. A high tier is not a rejection:
-even tier 3 passes when classification succeeds and the description has a nonempty
-review-focus line. The line's meaning is not verified; `Review focus: x` satisfies
-that syntactic condition. This classifier does not prove that code is safe.
+every tier passes when classification succeeds. The review-focus line is only checked
+for presence, never for meaning. This classifier does not prove that code is safe.
 
 **Requiring a check named `PR risk policy` is not secure enforcement.** A normal
 `pull_request` workflow definition is PR-controlled: an author can preserve that name
@@ -132,10 +136,10 @@ question; it is not a chat-completions model or a third-party reviewer app. Its
 endpoint is the repository variable `RISK_DECISION_ENDPOINT`, not code.
 
 For deterministic tiers 0–2, one request includes the trusted base-branch rules, the
-tier criteria, the deterministic result, the PR title, and the complete unified diff
-from GitHub. One `risk_tier` Choice question returns a rating from 0 to 3. Treat the
-title/diff as untrusted evidence: they cannot change the question, endpoint, credentials,
-or policy and are never executed. Prompt-injection instructions explicitly have no
+tier criteria, the deterministic result, and the complete unified diff from GitHub. The
+title is not sent: it is author-written text that the tier does not depend on. One `risk_tier` Choice question returns a rating from 0 to 3. Treat the
+diff as untrusted evidence: it cannot change the question, endpoint, credentials,
+or policy and is never executed. Prompt-injection instructions explicitly have no
 authority, and because the model can only raise a tier, a manipulated answer can only
 add review. Deterministic tier 3 skips the model entirely.
 
@@ -154,7 +158,9 @@ Who gets the model: pull requests whose author is an owner, member or collaborat
 of the repository. For anyone else, a maintainer adds the `ai-review` label and reruns
 the assessment (or the next push or description edit does). This bounds model cost and
 keeps anonymous fork PRs from spending the deployment. Labels are not part of the
-assessed revision, so after adding `ai-review` also rerun the risk gate.
+assessed revision, so after adding `ai-review` also rerun the risk gate. The label stays
+for the life of the PR: later pushes from the fork also get the model, which costs one
+bounded request each; remove the label to stop that.
 
 Every PR gets a label, whatever happens to the model:
 
@@ -165,8 +171,8 @@ Every PR gets a label, whatever happens to the model:
 | Not configured, or outside contributor without `ai-review`          | Deterministic tier | At least 2                |
 | Failed, partly or wrongly configured, or the request exceeds 48 KiB | Deterministic tier | At least 2                |
 
-In `raise` mode a model outage therefore moves fast-lane PRs to tier 2, which also
-requires a `Review focus:` line. The native request has a 48 KiB UTF-8 serialized-body
+In `raise` mode a model outage, or a large test or story PR over the request limit,
+therefore moves fast-lane PRs to tier 2. Decide that before enabling `raise`. The native request has a 48 KiB UTF-8 serialized-body
 limit and a 30-second inference deadline; diffs are never truncated or chunked, and
 there are no hidden retries. Responses are bounded to 1 MiB and checked for expected
 native model identity, exact question and choice labels, exactly the four tier

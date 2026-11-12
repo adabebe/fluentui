@@ -41,6 +41,7 @@ const maxSmallFixLines = 50;
 // GitHub lists at most 3,000 files for a pull request, so a list that long may be truncated.
 const maxListedFiles = 3000;
 const maxListedPaths = 5;
+const maxShownPathLength = 120;
 const changeFile = /^change\/[^/]+\.json$/;
 // A package source root eligible for the small-fix rule: `library/src/` (v9 React and charts packages), and the
 // web components package, which keeps its source in `src/`. Other `src/` folders belong to tooling, legacy v8 or
@@ -53,9 +54,10 @@ const sourceRoot = /^(packages\/(?:[^/]+\/)+?library\/src\/|packages\/web-compon
  * Anything else fails loudly instead of silently weakening a rule.
  *
  * @param {string} glob
+ * @param {string} [flags]
  * @returns {RegExp}
  */
-function compileGlob(glob) {
+function compileGlob(glob, flags) {
   if (/[?[\]{}!\\]/.test(glob)) {
     throw new Error(`Unsupported syntax in risk glob "${glob}": use literal paths, * and **.`);
   }
@@ -74,11 +76,12 @@ function compileGlob(glob) {
       return isLast ? escaped : `${escaped}/`;
     })
     .join('');
-  return new RegExp(`^${source}$`);
+  return new RegExp(`^${source}$`, flags);
 }
 
-const trivialPatterns = rules.trivial.map(compileGlob);
-const protectedPatterns = rules.protected.map(compileGlob);
+const trivialPatterns = rules.trivial.map(glob => compileGlob(glob));
+// Case-insensitive: agent tools and case-insensitive file systems treat `agents.md` like `AGENTS.md`.
+const protectedPatterns = rules.protected.map(glob => compileGlob(glob, 'i'));
 
 /** @typedef {{ filename: string; previous_filename?: string; additions: number; deletions: number; patch?: string }} ChangedFile */
 /** @typedef {0 | 1 | 2 | 3} Tier */
@@ -106,12 +109,17 @@ function isTestOrSnapshot(path) {
 }
 
 /**
- * A story or package-local document. Hidden files and tests never qualify, even inside an allowlisted folder.
+ * A story or package-local document. Hidden files, configuration files and tests never qualify, even inside an
+ * allowlisted folder.
  * @param {string} path
  */
 function isTrivialPath(path) {
+  const names = path.split('/');
   return (
-    matchesAny(path, trivialPatterns) && !path.split('/').some(name => name.startsWith('.')) && !isTestOrSnapshot(path)
+    matchesAny(path, trivialPatterns) &&
+    !names.some(name => name.startsWith('.')) &&
+    !names[names.length - 1].includes('.config.') &&
+    !isTestOrSnapshot(path)
   );
 }
 
@@ -125,11 +133,21 @@ function sourceRootOf(path) {
   return isTrivialPath(path) ? undefined : sourceRoot.exec(path)?.[1];
 }
 
+/**
+ * Shows a path from the PR in a code span. Paths are attacker-chosen, so control characters and backticks are
+ * replaced and long paths are cut: the check summary must not render headings or links from a file name.
+ * @param {string} path
+ */
+function showPath(path) {
+  const safe = path.replace(/[\u0000-\u001f\u007f`]/g, '?');
+  return `\`${safe.length > maxShownPathLength ? `${safe.slice(0, maxShownPathLength)}...` : safe}\``;
+}
+
 /** @param {string[]} paths */
 function listPaths(paths) {
   const unique = [...new Set(paths)];
   const rest = unique.length - maxListedPaths;
-  return unique.slice(0, maxListedPaths).join(', ') + (rest > 0 ? ` and ${rest} more` : '');
+  return unique.slice(0, maxListedPaths).map(showPath).join(', ') + (rest > 0 ? ` and ${rest} more` : '');
 }
 
 /**
@@ -145,7 +163,7 @@ function smallFixReason(files) {
   }
   const lines = files.reduce((total, file) => total + file.additions + file.deletions, 0);
   return lines <= maxSmallFixLines
-    ? `${lines} changed lines (limit ${maxSmallFixLines}) in one package: ${root}`
+    ? `${lines} changed lines (limit ${maxSmallFixLines}) in one package: ${showPath(root)}`
     : undefined;
 }
 
@@ -203,10 +221,14 @@ function classifyRisk(files, { changedFiles }) {
   return { tier: 2, reason: 'No fast-lane rule matches the complete diff.' };
 }
 
-/** @param {string | null} body */
+/**
+ * A nonempty `Review focus: ...` line outside comments and code blocks. A list bullet and bold around the label or
+ * the colon are accepted, so the common Markdown spellings count.
+ * @param {string | null} body
+ */
 function hasReviewFocus(body) {
   const visibleBody = (body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, '');
-  return /^(?:\*\*Review focus:\*\*|Review focus:)[ \t]*\S.*$/im.test(visibleBody);
+  return /^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?Review focus(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*[^\s*].*$/im.test(visibleBody);
 }
 
 module.exports = { classifyRisk, hasReviewFocus, rules, tierLabels, tiers };

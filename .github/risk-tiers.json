@@ -1,11 +1,10 @@
 {
-  "trivial": ["packages/**/stories/**", "packages/**/README.md", "packages/**/library/docs/**"],
+  "trivial": ["packages/*/*/stories/src/**", "packages/**/README.md", "packages/*/*/library/docs/**"],
   "protected": [
     "**/*.api.md",
     "**/package.json",
     "**/project.json",
     "**/tsconfig*.json",
-    "**/just.config.*",
     ".github/**",
     ".devops/**",
     ".agents/**",
@@ -33,6 +32,7 @@
     "nx.json",
     "migrations.json",
     "jest.preset.*",
+    "**/just.config.*",
     "*.config.*",
     "azure-pipelines*.yml",
     "packages/**/react-theme/**",

@@ -12,11 +12,10 @@ import {
 import { tiers } from './risk-tiers';
 
 const input = {
-  title: 'docs(button): clarify example',
   deterministic: { tier: 0, reason: 'Allowlisted package-local documentation.' },
   diff: 'diff --git a/packages/react/README.md b/packages/react/README.md\n--- a/packages/react/README.md\n+++ b/packages/react/README.md\n@@ -1 +1 @@\n-Example\n+Usage example\n',
 };
-const endpoint = 'https://decision.services.ai.azure.com/providers/microsoft/v1/systemone';
+const endpoint = 'https://example.services.ai.azure.com/v1/decide';
 const config = {
   endpoint,
   clientId: '11111111-1111-1111-1111-111111111111',
@@ -47,7 +46,6 @@ describe('Decision tier assessment', () => {
     expect(JSON.parse(body.state)).toEqual({
       rules: expect.objectContaining({ protected: expect.any(Array), trivial: expect.any(Array) }),
       deterministic: input.deterministic,
-      title: input.title,
       diff: input.diff,
     });
   });

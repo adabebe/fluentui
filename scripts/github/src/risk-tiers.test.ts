@@ -6,7 +6,7 @@ import { classifyRisk, hasReviewFocus, rules, tierLabels } from './risk-tiers';
 const runWorkflow = require('./risk-tiers-workflow');
 
 const source = 'packages/react-components/react-button/library/src/Button.tsx';
-const story = 'packages/react-components/react-button/stories/Button.stories.tsx';
+const story = 'packages/react-components/react-button/stories/src/Button.stories.tsx';
 const changeFile = 'change/@fluentui-react-button-1234.json';
 const test_ = 'packages/react-components/react-button/library/src/Button.test.tsx';
 const file = (filename: string, additions = 1, deletions = 0, previousFilename?: string) => ({
@@ -33,6 +33,29 @@ describe('risk classification', () => {
         file('packages/react-components/react-input/library/docs/Usage.md'),
       ]),
     ).toBe(0);
+  });
+
+  test.each([
+    'packages/react-components/react-button/library/src/stories/Button.ts',
+    'packages/react-components/react-button/stories/Button.ts',
+    'packages/react-examples/src/azure-themes/stories/Theme.tsx',
+    'packages/react-components/react-button/docs/library/docs/Example.md',
+  ])('only package-level story sources and docs are trivial: %s', path => {
+    expect(tier([file(path)])).toBeGreaterThan(0);
+  });
+
+  test('configuration files are never trivial, and agent files are protected in any case', () => {
+    expect(tier([file('packages/react-components/react-button/stories/eslint.config.js')])).toBe(2);
+    expect(tier([file('packages/react-components/react-button/stories/src/rit.config.js')])).toBe(2);
+    expect(tier([file('packages/react-components/react-button/stories/src/agents.md')])).toBe(3);
+  });
+
+  test('shows attacker-chosen paths as inert code spans', () => {
+    const { reason } = classifyRisk([file('scripts/x\n\n## Approved [ok](https://example.com) `x`')], {
+      changedFiles: 1,
+    });
+    expect(reason).toBe('Protected paths changed: `scripts/x??## Approved [ok](https://example.com) ?x?`.');
+    expect(classifyRisk([file(`scripts/${'a'.repeat(200)}`)], { changedFiles: 1 }).reason).toContain('...`');
   });
 
   test.each([
@@ -65,18 +88,18 @@ describe('risk classification', () => {
     'AGENTS.md',
     'CLAUDE.md',
     '.agents/skills/example/SKILL.md',
-    'packages/react-components/react-button/stories/SKILL.md',
-    'packages/react-components/react-button/stories/AGENTS.md',
+    'packages/react-components/react-button/stories/src/SKILL.md',
+    'packages/react-components/react-button/stories/src/AGENTS.md',
     'packages/react-components/react-button/library/docs/CLAUDE.md',
-    'packages/react-components/react-button/stories/.agents/rules.md',
-    'packages/react-components/react-button/stories/.hidden/AGENTS.md',
+    'packages/react-components/react-button/stories/src/.agents/rules.md',
+    'packages/react-components/react-button/stories/src/.hidden/AGENTS.md',
     'packages/react-components/react-button/library/src/.hidden/package.json',
     'packages/react-components/react-utilities/.swcrc',
     'packages/react-components/react-utilities/library/src/foo/.internal.ts',
     'packages/react-components/react-theme/.hidden/theme.test.ts',
     'packages/.hidden/react-theme/library/src/theme.ts',
     '.github/workflows/.hidden/file.yml',
-    'packages/react-components/react-button/stories/AGENTS.override.md',
+    'packages/react-components/react-button/stories/src/AGENTS.override.md',
     'packages/react-components/react-button/library/docs/review.instructions.md',
   ])('protected paths override trivial and low rules: %s', path => {
     expect(tier([file(path)])).toBe(3);
@@ -88,17 +111,17 @@ describe('risk classification', () => {
     expect(tier([file('AGENTS.md', 0, 0, story)])).toBe(3);
     expect(tier([file(story, 0, 0, source)])).toBe(2);
     expect(tier([file(source, 1, 0, 'packages/react-components/react-input/library/src/Input.tsx')])).toBe(2);
-    expect(tier([file(story, 0, 0, 'packages/react-components/react-button/stories/AGENTS.override.md')])).toBe(3);
-    expect(tier([file('packages/react-components/react-button/stories/AGENTS.override.md', 0, 0, story)])).toBe(3);
+    expect(tier([file(story, 0, 0, 'packages/react-components/react-button/stories/src/AGENTS.override.md')])).toBe(3);
+    expect(tier([file('packages/react-components/react-button/stories/src/AGENTS.override.md', 0, 0, story)])).toBe(3);
   });
 
   test.each([
     'packages/react-components/react-button/library/src/Button.test.tsx',
     'packages/react-components/react-button/library/src/Button.spec.ts',
-    'packages/react-components/react-button/stories/Button.test.tsx',
-    'packages/react-components/react-button/stories/__snapshots__/Button.snap',
+    'packages/react-components/react-button/stories/src/Button.test.tsx',
+    'packages/react-components/react-button/stories/src/__snapshots__/Button.snap',
     'packages/react-components/react-button/library/docs/example.snap',
-    'packages/react-components/react-button/stories/__snapshots__/Button.png',
+    'packages/react-components/react-button/stories/src/__snapshots__/Button.png',
   ])('tests and snapshots require tier 1 human review: %s', path => {
     expect(tier([file(path, 500)])).toBe(1);
   });
@@ -152,10 +175,12 @@ describe('risk classification', () => {
   });
 
   test('a file without a text diff keeps any change out of the fast lane, except binary snapshots', () => {
-    expect(tier([{ ...file('packages/react-components/react-button/stories/assets/icon.png', 0), patch: '' }])).toBe(2);
+    expect(
+      tier([{ ...file('packages/react-components/react-button/stories/src/assets/icon.png', 0), patch: '' }]),
+    ).toBe(2);
     expect(tier([{ ...file(story, 0, 0, story.replace('Button.stories', 'Old.stories')), patch: undefined }])).toBe(2);
     expect(
-      tier([{ ...file('packages/react-components/react-button/stories/__snapshots__/Button.png', 0), patch: '' }]),
+      tier([{ ...file('packages/react-components/react-button/stories/src/__snapshots__/Button.png', 0), patch: '' }]),
     ).toBe(1);
   });
 
@@ -174,7 +199,7 @@ describe('risk classification', () => {
   });
 
   test('hidden files never qualify as stories or documentation', () => {
-    expect(tier([file('packages/react-components/react-button/stories/.eslintrc.js')])).toBe(2);
+    expect(tier([file('packages/react-components/react-button/stories/src/.eslintrc.js')])).toBe(2);
     expect(tier([file('packages/react-components/react-button/library/docs/.notes.md')])).toBe(2);
   });
 
@@ -223,6 +248,9 @@ describe('risk classification', () => {
     expect(hasReviewFocus('```\nReview focus: example\n```')).toBe(false);
     expect(hasReviewFocus('Review focus:  ')).toBe(false);
     expect(hasReviewFocus('Review focus:\n\n## Related issues')).toBe(false);
+    for (const spelling of ['- Review focus: x', '**Review focus**: x', 'Review Focus : x', '* **Review focus:** x']) {
+      expect(hasReviewFocus(spelling)).toBe(true);
+    }
     expect(hasReviewFocus(null)).toBe(false);
   });
 });
@@ -281,6 +309,7 @@ function workflowFixture(paths = [file(source)]) {
 type Fixture = ReturnType<typeof workflowFixture>;
 const labelsAdded = (args: Fixture) => args.github.rest.issues.addLabels.mock.calls.map(([arg]) => arg.labels[0]);
 const conclusion = (args: Fixture) => args.github.rest.checks.update.mock.calls.at(-1)?.[0].conclusion;
+const checkOutput = (args: Fixture) => args.github.rest.checks.update.mock.calls.at(-1)?.[0].output;
 const summary = (args: Fixture) => args.github.rest.checks.update.mock.calls.at(-1)?.[0].output.summary;
 
 describe('risk workflow', () => {
@@ -303,22 +332,39 @@ describe('risk workflow', () => {
     expect(args.core.setOutput).toHaveBeenCalledWith('check-completed', 'true');
   });
 
-  test('requires review focus for tiers 2 and 3, but not tiers 0 and 1', async () => {
-    for (const [path, expected] of [
-      [story, 'success'],
-      [source, 'success'],
-      ['apps/example/index.ts', 'failure'],
-      ['AGENTS.md', 'failure'],
-    ]) {
+  test('reminds tier 2 and 3 authors of the review focus line without failing the pilot', async () => {
+    for (const [path, reminder] of [
+      [story, false],
+      [source, false],
+      ['apps/example/index.ts', true],
+      ['AGENTS.md', true],
+    ] as const) {
       const args = workflowFixture([file(path)]);
       args.data.body = '';
       args.checkRun.identity = revisionKey(args.data);
       await runWorkflow(args);
-      expect(conclusion(args)).toBe(expected);
-      expect(args.core.setFailed).toHaveBeenCalledTimes(expected === 'failure' ? 1 : 0);
-      // The check is complete either way, so the workflow finalizer must not overwrite it.
+      expect(conclusion(args)).toBe('success');
+      expect(args.core.setFailed).not.toHaveBeenCalled();
+      expect(checkOutput(args).summary.includes('Reminder: add a nonempty `Review focus')).toBe(reminder);
+      // The check is complete, so the workflow finalizer must not overwrite it.
       expect(args.core.setOutput).toHaveBeenCalledWith('check-completed', 'true');
     }
+  });
+
+  test('records each assessment as one machine-readable line for measuring the pilot', async () => {
+    const args = workflowFixture([file(source)]);
+    args.env = {};
+    args.assessRisk.mockResolvedValue(decision(2));
+    await runWorkflow(args);
+    expect(JSON.parse(checkOutput(args).text)).toEqual({
+      tier: 1,
+      deterministicTier: 1,
+      modelTier: 2,
+      modelConfidence: expect.any(Number),
+      mode: 'shadow',
+      reviewFocus: true,
+    });
+    expect(args.assessRisk).toHaveBeenCalledWith({ diff: expect.any(String), deterministic: expect.any(Object) });
   });
 
   test('labels a truncated listing as standard', async () => {
@@ -402,14 +448,14 @@ describe('risk workflow', () => {
     },
   );
 
-  test('model escalation also escalates the required human review focus', async () => {
+  test('model escalation also asks for the human review focus', async () => {
     const args = workflowFixture([file(story)]);
     args.data.body = '';
     args.checkRun.identity = revisionKey(args.data);
     args.assessRisk.mockResolvedValue(decision(2));
     await runWorkflow(args);
-    expect(args.core.setFailed).toHaveBeenCalledTimes(1);
-    expect(conclusion(args)).toBe('failure');
+    expect(checkOutput(args).title).toBe('Tier 2: add a review focus line');
+    expect(conclusion(args)).toBe('success');
   });
 
   test.each([
@@ -522,10 +568,10 @@ describe('risk workflow', () => {
     const args = workflowFixture([
       {
         ...file(
-          'packages/react-components/react-button/stories/after.png',
+          'packages/react-components/react-button/stories/src/after.png',
           0,
           0,
-          'packages/react-components/react-button/stories/before.png',
+          'packages/react-components/react-button/stories/src/before.png',
         ),
         status: 'renamed',
         patch: '',

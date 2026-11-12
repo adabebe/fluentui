@@ -37,13 +37,13 @@ function configuredModel(core, env) {
  * configured, not allowed to run (an outside contributor's PR without `ai-review`), or fails, the tier is at least 2.
  *
  * @param {{
- *   pull: { title: string; author_association: string; labels: { name?: string }[] };
+ *   pull: { author_association: string; labels: { name?: string }[] };
  *   deterministic: { tier: Tier; reason: string };
  *   getDiff: () => Promise<unknown>;
  *   assessRisk: AssessRisk | undefined;
  *   raise: boolean;
  * }} args
- * @returns {Promise<{ tier: number; summary: string }>}
+ * @returns {Promise<{ tier: number; summary: string; modelTier?: number; confidence?: number }>}
  */
 async function escalate({ pull, deterministic, getDiff, assessRisk, raise }) {
   const floor = deterministic.tier;
@@ -71,16 +71,18 @@ async function escalate({ pull, deterministic, getDiff, assessRisk, raise }) {
     if (typeof diff !== 'string') {
       throw new Error('GitHub did not return the PR diff.');
     }
-    const decision = await assessRisk({ diff, deterministic, title: pull.title });
+    const decision = await assessRisk({ diff, deterministic });
     const suggested = Math.max(floor, decision.tier);
     const details =
       `Model suggested tier ${decision.tier}. Model ${decision.model}, confidence ${decision.confidence} ` +
       `(uncalibrated), tokens ${decision.inputTokens} input / ${decision.outputTokens} output.`;
+    const measured = { modelTier: decision.tier, confidence: decision.confidence };
     return raise
-      ? { tier: suggested, summary: details }
+      ? { tier: suggested, summary: details, ...measured }
       : {
           tier: floor,
           summary: `Shadow mode, not applied: with the model this would be tier ${suggested}. ${details}`,
+          ...measured,
         };
   } catch (error) {
     return unassessed(
@@ -120,6 +122,7 @@ module.exports = async ({
       throw new Error('The PR no longer matches the trusted workflow revision. Trigger a fresh classification.');
     }
 
+    const raise = env.RISK_MODEL_MODE === 'raise';
     const files = await github.paginate(github.rest.pulls.listFiles, { ...params, per_page: 100 });
     const deterministic = classifyRisk(files, { changedFiles: pull.changed_files });
     const model = await escalate({
@@ -127,7 +130,7 @@ module.exports = async ({
       deterministic,
       getDiff: async () => (await github.rest.pulls.get({ ...params, mediaType: { format: 'diff' } })).data,
       assessRisk,
-      raise: env.RISK_MODEL_MODE === 'raise',
+      raise,
     });
     const tier = model.tier;
     const focusPresent = tier < 2 || hasReviewFocus(pull.body);
@@ -152,7 +155,7 @@ module.exports = async ({
       model.summary,
       'Pilot: human approval remains required for every tier. Labels never authorize a merge or skip CI.',
       tier === 3 ? 'AI may comment but must not approve tier 3 changes.' : '',
-      focusPresent ? '' : 'Add a nonempty `Review focus: ...` line to the PR description for tier 2 or 3.',
+      focusPresent ? '' : 'Reminder: add a nonempty `Review focus: ...` line to the PR description for tier 2 or 3.',
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -161,14 +164,24 @@ module.exports = async ({
       repo,
       check_run_id: checkRun.id,
       status: 'completed',
-      conclusion: focusPresent ? 'success' : 'failure',
-      output: { title: `Tier ${tier}: ${focusPresent ? 'policy satisfied' : 'review focus required'}`, summary },
+      // Label-only pilot: a missing Review focus line is a reminder, never a failure.
+      conclusion: 'success',
+      output: {
+        title: `Tier ${tier}: ${focusPresent ? 'policy satisfied' : 'add a review focus line'}`,
+        summary,
+        // One machine-readable record per assessment, for measuring the pilot from the Checks API.
+        text: JSON.stringify({
+          tier,
+          deterministicTier: deterministic.tier,
+          modelTier: model.modelTier ?? null,
+          modelConfidence: model.confidence ?? null,
+          mode: raise ? 'raise' : 'shadow',
+          reviewFocus: focusPresent,
+        }),
+      },
     });
     core.setOutput('check-completed', 'true');
     await core.summary.addRaw(summary).write();
-    if (!focusPresent) {
-      core.setFailed('Tier 2 and 3 pull requests require a Review focus line.');
-    }
   } catch (error) {
     await github.rest.checks.update({
       owner,
