@@ -16,7 +16,7 @@ jobs:
     name: Label areas
     # Area labels depend on the changed files only, as before the risk pilot; a pilot failure cannot affect them.
     # Runs on every event: the shared concurrency group may replace a pending push run with a later edit run.
-    if: ${{ github.repository_owner == 'microsoft' }}
+    if: ${{ github.repository_owner == 'adabebe' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -31,7 +31,7 @@ jobs:
 
   assess:
     name: Assess review risk
-    if: ${{ github.repository_owner == 'microsoft' }}
+    if: ${{ github.repository_owner == 'adabebe' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
