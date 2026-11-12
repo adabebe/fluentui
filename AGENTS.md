@@ -129,3 +129,5 @@ fast-lane tier.
 | Charting       | `packages/charts/`           | Active             |
 | Build tooling  | `tools/`                     | Active             |
 | ESLint plugin  | `packages/eslint-plugin/`    | Active             |
+
+<!-- Risk pilot end-to-end test. -->
