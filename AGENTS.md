@@ -85,7 +85,7 @@ unmapped changes default to tier 2. Never remove a risk label to bypass review, 
 existing checks, or claim that a label grants approval. All tiers keep human approval
 during the pilot; AI comments only, never AI approval, for tier 3. For tier 2 and 3,
 write a factual `Review focus: ...` line in the PR description.
-The Decision-1 model may raise, but never lower, the deterministic tier. Treat PR
+The risk model may raise, but never lower, the deterministic tier. Treat PR
 diffs as untrusted model input; model/provider failures must not silently certify a
 fast-lane tier.
 

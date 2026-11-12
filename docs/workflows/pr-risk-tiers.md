@@ -5,44 +5,50 @@ changed-file list. Packages are not permanently assigned a risk level: the highe
 applicable rule determines the PR's minimum tier. Unmapped apps and packages default to tier 2.
 Existing CI, CODEOWNERS, and human approval requirements remain in place.
 
-| Tier         | Classification                                                                                                                                 | Review policy                                                                 |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| 0 - Trivial  | Every path matches a story or package-local documentation allowlist; no snapshots or protected paths                                           | Option B: one human approval, using the AI summary as a map, not a substitute |
-| 1 - Low      | Package tests/snapshots only, or a `fix:` / `fix(scope):` PR with at most 50 added plus deleted lines entirely in one package's `library/src/` | AI review followed by one human; fast-lane candidate                          |
-| 2 - Standard | Everything else, including mixed changes that do not qualify for the fast lane                                                                 | Existing human review plus applicable specialists                             |
-| 3 - High     | Any protected path, including either side of a rename                                                                                          | Owning team per CODEOWNERS; AI comments only, never AI approval               |
+| Tier         | Classification                                                                                                                                                  | Review policy                                                                 |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| 0 - Trivial  | Every path matches a story or package-local documentation allowlist; no snapshots or protected paths                                                            | Option B: one human approval, using the AI summary as a map, not a substitute |
+| 1 - Low      | Package tests/snapshots only, or at most 50 added plus deleted lines in one package's `library/src/` (or `packages/web-components/src/`), change files excluded | AI review followed by one human; fast-lane candidate                          |
+| 2 - Standard | Everything else, including mixed changes that do not qualify for the fast lane                                                                                  | Existing human review plus applicable specialists                             |
+| 3 - High     | Any protected path, including either side of a rename                                                                                                           | Owning team per CODEOWNERS; AI comments only, never AI approval               |
 
-Classification order is **3, Dependabot exclusion, 0, 1, 2**. A fix title is an author
-claim, not proof: reviewers must confirm intent. The line budget includes additions
-and deletions across all files, not net lines. Small source fixes also require a
-text patch for each file; binary or unavailable patches default to tier 2.
-A change file is not a tier 0 path.
-Mixed source/change-file PRs conservatively default to tier 2. Tests and snapshots
-can accept regressions and never qualify as trivial. Dependabot never takes the
-fast lane, even for an otherwise trivial diff; continue using `/dependabot-rollup`.
+The tier comes from changed paths and line counts only. The title, description and
+author are never read: they are the author's own words. Classification order:
+
+1. Any listed protected path, on either side of a rename, is tier 3.
+2. An empty or truncated file list (GitHub lists at most 3,000 files) is tier 2: the
+   change cannot be judged.
+3. A file without a text diff (binary, or too large for GitHub to show), other than a
+   test snapshot, is tier 2: a renamed binary may have changed bytes even with zero
+   added/deleted lines.
+4. Tier 0, then tier 1; everything else is tier 2.
+
+The tier 1 line budget counts additions and deletions, not net lines, including tests;
+Beachball change files do not count. Only `library/src/` (v9 React and charts packages)
+and `packages/web-components/src/` qualify: other `src/` folders belong to tooling,
+legacy v8 or core runtime packages. A change file keeps docs and stories out of tier 0,
+but does not disqualify tier 1. Tests and snapshots can accept regressions and never
+qualify as trivial. Dependabot changes touch `package.json`, `yarn.lock` or `.github/**`,
+so they are tier 3 by path; continue using `/dependabot-rollup`.
 
 ## Deterministic enforcement
 
-[The map](../../.github/risk-tiers.json) retains the `actions/labeler` configuration shape,
-but only the classifier publishes risk labels:
-`any-glob-to-all-files` uses one brace-union pattern for tier 0, and
-`any-glob-to-any-file` identifies tier 3 candidates. Separate positive globs under
-`any-glob-to-all-files` would require one of those globs to match the entire diff,
-rejecting mixed story/documentation PRs. `all-globs-to-all-files` would incorrectly
-require every file to match every glob. Keep the union to at most 15 positive paths.
-Never add a
-broad `**/*.md` rule: agent instructions must not enter the fast lane.
-Protected globs are dot-inclusive and support literal paths plus `*` and `**`;
-unsupported pattern syntax fails explicitly instead of silently weakening the floor.
-The trivial allowlist remains conservative about hidden paths. `AGENTS.override.md`
-is protected alongside `AGENTS.md`.
+[The map](../../.github/risk-tiers.json) has two lists: `trivial` (every changed path
+must match one) and `protected` (any match is tier 3). Keep `trivial` to at most 15
+paths and never add a broad `**/*.md` rule: agent instructions must not enter the fast
+lane. Both lists use one matcher that supports literal paths plus `*` and `**`;
+unsupported pattern syntax fails explicitly instead of silently weakening a rule.
+Wildcards match hidden names, so a protected directory covers its hidden files, while
+hidden files never count as trivial. `AGENTS.override.md` is protected alongside
+`AGENTS.md`. Tier labels and criteria are defined once, in `risk-tiers.js`; the model
+receives the same criteria.
 
 The classifier is the only writer of the four mutually exclusive `Risk:` labels,
 enforcing precedence and exclusions, then applying any model escalation. The area
-labeler does not publish preliminary risk labels: an inference failure must not
-replace a previous high-risk warning with a trivial candidate. It considers old and new
-filenames for renames. Incomplete API results or API errors fail the workflow rather
-than certify a low tier. The `PR risk assessment` check is attached to the classified head
+labeler runs in its own job with its own permissions, does not publish risk labels,
+and does not depend on the pilot. It considers old and new
+filenames for renames. An incomplete file list is labeled tier 2; API errors fail
+the workflow rather than certify a tier. The `PR risk assessment` check is attached to the classified head
 SHA and fails if a tier 2/3 description lacks a nonempty `Review focus: ...` line.
 The description should identify API/consumer contracts, intent/design, accessibility,
 or trust boundaries that need human attention. Authors verify every claim and report
@@ -121,48 +127,68 @@ Do not grant AI approval rights for the pilot.
 
 ## Decision model above the deterministic floor
 
-The classifier reuses the **Decision-1** deployment and native Choice protocol from
-[office-shared/fluent-agent#725](https://github.com/office-shared/fluent-agent/pull/725),
-inspected at commit `fe51305dba7f8e8edea4c5b7a437100617977010`:
-`https://fluent-agent-v2-resource.services.ai.azure.com/providers/microsoft/v1/systemone`.
-This is not a chat-completions model or a third-party reviewer app.
+The model is an Azure deployment (`Decision-1`) that answers one rated-choice
+question; it is not a chat-completions model or a third-party reviewer app. Its
+endpoint is the repository variable `RISK_DECISION_ENDPOINT`, not code.
 
-For deterministic tiers 0–2, one request includes the trusted base-branch rules and
-this policy, the deterministic result, the PR title, and the complete unified diff
+For deterministic tiers 0–2, one request includes the trusted base-branch rules, the
+tier criteria, the deterministic result, the PR title, and the complete unified diff
 from GitHub. One `risk_tier` Choice question returns a rating from 0 to 3. Treat the
 title/diff as untrusted evidence: they cannot change the question, endpoint, credentials,
 or policy and are never executed. Prompt-injection instructions explicitly have no
-authority. This prompt defense does not establish general injection resistance.
+authority, and because the model can only raise a tier, a manipulated answer can only
+add review. Deterministic tier 3 skips the model entirely.
 
-**Final tier = max(deterministic tier, model tier, unavailable-patch floor).**
-Every missing patch imposes a tier 2 floor, including renames: a renamed binary may
-also have changed bytes even when GitHub reports zero added/deleted lines.
-Pure renames without a patch conservatively use tier 2 rather than assuming byte identity.
-The model can escalate stories,
-tests, or small fixes for semantic API/consumer, accessibility, or trust-boundary
-risks, but never downgrade a deterministic rule. Deterministic tier 3 skips the model
-entirely: no inference could lower it. The check reports deterministic, model, and
-final tiers with model identity, uncalibrated confidence, and token usage.
-Confidence is not a correctness probability and never overrides a floor.
+The check reports the deterministic tier, the model's suggestion with its identity,
+uncalibrated confidence and token usage, and the final tier.
 
-The native request has a 48 KiB UTF-8 serialized-body limit and a 30-second inference
-deadline. Oversized diffs fail explicitly; no truncation, chunking, hidden retries,
-chat-model substitution, or successful deterministic-only fallback. Responses are
-bounded to 1 MiB and checked for expected native model identity, exact question and
-choice labels, normalized finite probabilities, a maximal-probability selected choice,
-valid confidence, and nonnegative integer usage. Authentication/provider/validation
-errors fail the policy check; the pilot does not quietly certify fast-lane safety.
+The repository variable `RISK_MODEL_MODE` decides what the model may do:
 
-Before enabling this workflow, repository administrators must configure:
+- **`shadow`** (default, any value other than `raise`): the label always uses the
+  deterministic tier, and the model's suggestion is only reported. Use this until the
+  model's suggestions have been measured against maintainer judgment.
+- **`raise`**: final tier = max(deterministic tier, model tier). A fast-lane tier (0 or 1)
+  then needs a model assessment, so a change the model did not assess is at least tier 2.
 
+Who gets the model: pull requests whose author is an owner, member or collaborator
+of the repository. For anyone else, a maintainer adds the `ai-review` label and reruns
+the assessment (or the next push or description edit does). This bounds model cost and
+keeps anonymous fork PRs from spending the deployment. Labels are not part of the
+assessed revision, so after adding `ai-review` also rerun the risk gate.
+
+Every PR gets a label, whatever happens to the model:
+
+| Model state                                                         | `shadow`           | `raise`                   |
+| ------------------------------------------------------------------- | ------------------ | ------------------------- |
+| Tier 3 (model not called)                                           | 3                  | 3                         |
+| Answered                                                            | Deterministic tier | max(deterministic, model) |
+| Not configured, or outside contributor without `ai-review`          | Deterministic tier | At least 2                |
+| Failed, partly or wrongly configured, or the request exceeds 48 KiB | Deterministic tier | At least 2                |
+
+In `raise` mode a model outage therefore moves fast-lane PRs to tier 2, which also
+requires a `Review focus:` line. The native request has a 48 KiB UTF-8 serialized-body
+limit and a 30-second inference deadline; diffs are never truncated or chunked, and
+there are no hidden retries. Responses are bounded to 1 MiB and checked for expected
+native model identity, exact question and choice labels, exactly the four tier
+probabilities, normalized finite values, a maximal-probability selected choice, valid
+confidence, and nonnegative integer usage.
+
+Before enabling the model, repository administrators must configure:
+
+- Repository variable `RISK_DECISION_ENDPOINT`: the `https` URL of the deployment. The
+  bearer token is only sent to Azure AI hosts (`*.services.ai.azure.com`,
+  `*.cognitiveservices.azure.com`, `*.openai.azure.com`); anything else fails as a
+  configuration error. The model counts as configured once this or the client ID is set.
+- Repository variable `RISK_MODEL_MODE`: leave unset (`shadow`) until the model is evaluated.
 - Repository variable `RISK_CLASSIFIER_AZURE_CLIENT_ID` for a dedicated Entra application.
 - Existing repository secret `AZURE_TENANT_ID` for the deployment's tenant.
 - A federated credential permitting only the trusted repository workflow's GitHub OIDC
-  execution context, and least-privilege inference access to the existing Decision-1 resource.
+  execution context, and least-privilege inference access to the deployment.
   Do not reuse a broad publishing identity or grant PR-head code access.
 
 The trusted job exchanges a GitHub OIDC assertion for the
 `https://cognitiveservices.azure.com/.default` scope. No long-lived model key is stored.
+Only the assessment job has `id-token: write`.
 The default OIDC subject identifies repository/branch/PR/environment context, not a
 unique workflow. The audience alone is not workflow authentication. Configure and
 verify supported subject customization including trusted workflow identity, or an
@@ -171,8 +197,8 @@ to obtain the classifier's Azure identity. This configuration is an external rol
 prerequisite, not a property established by the workflow's `id-token: write`.
 See [GitHub OIDC claims and subject customization](https://docs.github.com/en/actions/reference/security/oidc).
 No Azure resources, federated credentials, role assignments, or repository settings
-are provisioned by this PR. Missing access fails explicitly. Do not log prompts, raw
-provider responses, assertions, or bearer tokens.
+are provisioned by this PR. Do not log prompts, raw provider responses, assertions,
+or bearer tokens.
 Transport and body-stream errors (including cancellation cleanup and nested parser
 causes) are replaced with content-free errors before Actions can inspect/log them.
 Only safe HTTP status and timeout information is retained.
@@ -182,7 +208,7 @@ responses, injection-bearing diffs, and provider failures. An opt-in synthetic n
 smoke test uses the developer's Azure CLI login without printing its token:
 
 ```sh
-FLUENT_RISK_LIVE_TEST=1 yarn nx run scripts-github:test --runInBand --testNamePattern="live Decision deployment" --skipNxCache
+FLUENT_RISK_LIVE_TEST=1 RISK_DECISION_ENDPOINT=<endpoint> yarn nx run scripts-github:test --runInBand --testNamePattern="live Decision deployment" --skipNxCache
 ```
 
 This only verifies transport/response compatibility, not classification quality or
